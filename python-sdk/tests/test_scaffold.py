@@ -119,6 +119,9 @@ def test_cargo_add_command():
 def test_frontend_add_command():
     assert scaffold.frontend_add_command("npm", Source()) == ["npm", "install", f"tauri-plugin-py-runtime-api@{SDK_VERSION}"]
     assert scaffold.frontend_add_command("yarn", Source("git")) == ["yarn", "add", scaffold.GITHUB_SPEC]
+    assert scaffold.frontend_add_command("pnpm", Source("git")) == [
+        "pnpm", "add", "--allow-build=tauri-plugin-py-runtime-api", scaffold.GITHUB_SPEC,
+    ]
     assert scaffold.frontend_add_command("pnpm", Source("path", REPO)) == ["pnpm", "add", f"link:{REPO}"]
     assert scaffold.frontend_add_command("bun", Source("path", REPO)) == ["bun", "add", f"file:{REPO}"]
 

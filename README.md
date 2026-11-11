@@ -42,7 +42,8 @@ Steps it can't apply safely (an unusual `lib.rs`, `Tauri.toml`, list-form `bundl
 are printed for you to do by hand. Re-running is safe: files already set up are left alone, and
 `--force` continues when `src-python` exists without overwriting its files.
 
-Pass `--git` to install all three packages from GitHub, or `--path <checkout>` to use a local
+Pass `--git` to install all three packages from GitHub (with pnpm this needs pnpm ≥ 10, which
+must be allowed to build the frontend package from git; `init` passes `--allow-build`), or `--path <checkout>` to use a local
 clone of this repository (build its frontend package first with `pnpm install && pnpm build`).
 
 Then `pnpm tauri dev` runs `src-python/main.py` with `src-python/.venv`, and

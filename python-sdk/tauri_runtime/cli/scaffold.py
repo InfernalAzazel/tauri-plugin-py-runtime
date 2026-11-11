@@ -175,6 +175,9 @@ def frontend_add_command(manager: str, source: Source) -> list[str]:
         spec = f"{'link' if manager == 'pnpm' else 'file'}:{source.path}"
     else:
         spec = f"{NPM_PACKAGE}@{SDK_VERSION}"
+    if manager == "pnpm" and source.kind == "git":
+        # pnpm 10+ 默认禁止 git 依赖执行构建脚本（`prepare` 编译 dist-js），需显式放行。
+        return ["pnpm", "add", f"--allow-build={NPM_PACKAGE}", spec]
     return [manager, "install" if manager == "npm" else "add", spec]
 
 

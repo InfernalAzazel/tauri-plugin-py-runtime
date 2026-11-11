@@ -288,9 +288,9 @@ impl Supervisor {
     self.bridge.call(&writer, cmd, args, channels, opts, self.config.invoke_timeout).await
   }
 
-  pub fn cancel(&self, client_id: &str) -> bool {
+  pub fn cancel(&self, window: &str, client_id: &str) -> bool {
     let writer = self.writer.lock().unwrap().clone();
-    self.bridge.cancel(writer.as_ref(), client_id)
+    self.bridge.cancel(writer.as_ref(), window, client_id)
   }
 
   pub fn emit(&self, event: &str, payload: Payload, window: Option<&str>) -> Result<()> {

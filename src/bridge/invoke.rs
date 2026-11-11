@@ -32,10 +32,16 @@ pub struct CallOptions {
   pub window: Option<String>,
 }
 
+/// Per-call timeouts from the frontend are capped at this multiple of the default.
+pub const MAX_TIMEOUT_FACTOR: u32 = 10;
+
+/// Client call ids are scoped per window: `(window label, client id)`.
+type ClientKey = (String, String);
+
 struct Pending {
   tx: oneshot::Sender<Result<Payload>>,
   channels: Vec<u64>,
-  client_id: Option<String>,
+  client: Option<ClientKey>,
 }
 
 #[derive(Default)]
@@ -43,7 +49,7 @@ pub struct Bridge {
   next_id: AtomicU64,
   next_channel: AtomicU64,
   pending: Mutex<HashMap<u64, Pending>>,
-  clients: Mutex<HashMap<String, u64>>,
+  clients: Mutex<HashMap<ClientKey, u64>>,
   channels: Mutex<HashMap<u64, ChannelSink>>,
 }
 
@@ -66,6 +72,20 @@ impl Bridge {
     default_timeout: Duration,
   ) -> Result<Payload> {
     let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+    let client = opts
+      .client_id
+      .as_ref()
+      .map(|client_id| (opts.window.clone().unwrap_or_default(), client_id.clone()));
+    if let Some(key) = &client {
+      let mut clients = self.clients.lock().unwrap();
+      if clients.contains_key(key) {
+        return Err(Error::new(
+          codes::INVALID_ARGS,
+          format!("call id '{}' is already pending in this window", key.1),
+        ));
+      }
+      clients.insert(key.clone(), id);
+    }
     let mut channel_ids = Map::new();
     let mut registered = Vec::with_capacity(channels.len());
     {
@@ -79,13 +99,7 @@ impl Bridge {
     }
 
     let (tx, rx) = oneshot::channel();
-    self.pending.lock().unwrap().insert(
-      id,
-      Pending { tx, channels: registered, client_id: opts.client_id.clone() },
-    );
-    if let Some(client_id) = &opts.client_id {
-      self.clients.lock().unwrap().insert(client_id.clone(), id);
-    }
+    self.pending.lock().unwrap().insert(id, Pending { tx, channels: registered, client });
 
     let mut header = json!({ "id": id, "cmd": cmd });
     if !channel_ids.is_empty() {
@@ -99,7 +113,9 @@ impl Bridge {
       return Err(e);
     }
 
-    let timeout = opts.timeout.unwrap_or(default_timeout);
+    let timeout = opts
+      .timeout
+      .map_or(default_timeout, |t| t.min(default_timeout * MAX_TIMEOUT_FACTOR));
     match tokio::time::timeout(timeout, rx).await {
       Ok(Ok(result)) => result,
       Ok(Err(_)) => Err(Error::new(codes::RUNTIME_EXITED, "python runtime exited")),
@@ -117,8 +133,11 @@ impl Bridge {
 
   fn finish(&self, id: u64) -> Option<Pending> {
     let pending = self.pending.lock().unwrap().remove(&id)?;
-    if let Some(client_id) = &pending.client_id {
-      self.clients.lock().unwrap().remove(client_id);
+    if let Some(key) = &pending.client {
+      let mut clients = self.clients.lock().unwrap();
+      if clients.get(key) == Some(&id) {
+        clients.remove(key);
+      }
     }
     let mut channels = self.channels.lock().unwrap();
     for channel_id in &pending.channels {
@@ -127,8 +146,9 @@ impl Bridge {
     Some(pending)
   }
 
-  pub fn cancel(&self, writer: Option<&Writer>, client_id: &str) -> bool {
-    let id = { self.clients.lock().unwrap().get(client_id).copied() };
+  pub fn cancel(&self, writer: Option<&Writer>, window: &str, client_id: &str) -> bool {
+    let key = (window.to_string(), client_id.to_string());
+    let id = { self.clients.lock().unwrap().get(&key).copied() };
     let Some(id) = id else { return false };
     let Some(pending) = self.finish(id) else { return false };
     if let Some(writer) = writer {
@@ -279,16 +299,78 @@ mod tests {
     assert_eq!(cancel.header_str("reason"), Some("timeout"));
   }
 
+  fn client_opts(window: &str, client_id: &str) -> CallOptions {
+    CallOptions { client_id: Some(client_id.into()), window: Some(window.into()), ..Default::default() }
+  }
+
   #[tokio::test]
   async fn client_cancel() {
     let (bridge, writer, mut rx) = setup();
-    let opts = CallOptions { client_id: Some("c1".into()), ..Default::default() };
-    let call = spawn_call(&bridge, &writer, "slow", opts, vec![]);
+    let call = spawn_call(&bridge, &writer, "slow", client_opts("main", "c1"), vec![]);
     rx.recv().await.unwrap();
-    assert!(bridge.cancel(Some(&writer), "c1"));
-    assert!(!bridge.cancel(Some(&writer), "c1"));
+    assert!(!bridge.cancel(Some(&writer), "other", "c1"));
+    assert!(bridge.cancel(Some(&writer), "main", "c1"));
+    assert!(!bridge.cancel(Some(&writer), "main", "c1"));
     assert_eq!(call.await.unwrap().unwrap_err().code, codes::CANCELLED);
     assert_eq!(rx.recv().await.unwrap().header_str("reason"), Some("client"));
+  }
+
+  #[tokio::test]
+  async fn duplicate_pending_client_id_is_rejected() {
+    let (bridge, writer, mut rx) = setup();
+    let first = spawn_call(&bridge, &writer, "slow", client_opts("main", "c1"), vec![]);
+    let id = rx.recv().await.unwrap().header_u64("id").unwrap();
+    let dup = spawn_call(&bridge, &writer, "slow", client_opts("main", "c1"), vec![]);
+    assert_eq!(dup.await.unwrap().unwrap_err().code, codes::INVALID_ARGS);
+    assert!(rx.try_recv().is_err(), "duplicate call must not reach python");
+    bridge.handle(response(id, Payload::None), &NullSink);
+    first.await.unwrap().unwrap();
+    let again = spawn_call(&bridge, &writer, "slow", client_opts("main", "c1"), vec![]);
+    rx.recv().await.unwrap();
+    assert!(bridge.cancel(Some(&writer), "main", "c1"));
+    assert_eq!(again.await.unwrap().unwrap_err().code, codes::CANCELLED);
+  }
+
+  #[tokio::test]
+  async fn same_client_id_in_different_windows_is_independent() {
+    let (bridge, writer, mut rx) = setup();
+    let a = spawn_call(&bridge, &writer, "slow", client_opts("a", "c1"), vec![]);
+    let id_a = rx.recv().await.unwrap().header_u64("id").unwrap();
+    let b = spawn_call(&bridge, &writer, "slow", client_opts("b", "c1"), vec![]);
+    let id_b = rx.recv().await.unwrap().header_u64("id").unwrap();
+    assert!(bridge.cancel(Some(&writer), "b", "c1"));
+    assert_eq!(b.await.unwrap().unwrap_err().code, codes::CANCELLED);
+    assert_eq!(rx.recv().await.unwrap().header_u64("id"), Some(id_b));
+    assert!(bridge.cancel(Some(&writer), "a", "c1"));
+    assert_eq!(a.await.unwrap().unwrap_err().code, codes::CANCELLED);
+    assert_eq!(rx.recv().await.unwrap().header_u64("id"), Some(id_a));
+  }
+
+  #[test]
+  fn finish_keeps_newer_client_mapping() {
+    let bridge = Bridge::new();
+    let key = ("main".to_string(), "c1".to_string());
+    let (tx, _rx) = oneshot::channel();
+    bridge.pending.lock().unwrap().insert(1, Pending { tx, channels: vec![], client: Some(key.clone()) });
+    bridge.clients.lock().unwrap().insert(key.clone(), 2);
+    assert!(bridge.finish(1).is_some());
+    assert_eq!(bridge.clients.lock().unwrap().get(&key), Some(&2));
+  }
+
+  #[tokio::test]
+  async fn per_call_timeout_is_capped() {
+    let (bridge, writer, mut rx) = setup();
+    let opts = CallOptions { timeout: Some(Duration::from_secs(60)), ..Default::default() };
+    let call = {
+      let (bridge, writer) = (bridge.clone(), writer.clone());
+      tokio::spawn(async move {
+        bridge.call(&writer, "slow", Payload::None, vec![], opts, Duration::from_millis(10)).await
+      })
+    };
+    rx.recv().await.unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(2), call).await.expect("cap not applied").unwrap().unwrap_err();
+    assert_eq!(err.code, codes::TIMEOUT);
+    assert!(err.message.contains("100ms"), "{}", err.message);
   }
 
   #[tokio::test]

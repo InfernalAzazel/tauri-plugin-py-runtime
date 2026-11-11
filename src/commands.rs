@@ -106,8 +106,8 @@ pub(crate) async fn invoke<R: Runtime>(
 }
 
 #[command]
-pub(crate) fn cancel(state: State<'_, PyRuntime>, id: String) -> bool {
-  state.supervisor().cancel(&id)
+pub(crate) fn cancel<R: Runtime>(webview: Webview<R>, state: State<'_, PyRuntime>, id: String) -> bool {
+  state.supervisor().cancel(webview.label(), &id)
 }
 
 #[command]

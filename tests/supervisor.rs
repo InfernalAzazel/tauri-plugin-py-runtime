@@ -112,11 +112,11 @@ async fn timeout_and_cancel() {
   let err = sup.call("sleep", json_payload(json!({"ms": 2000})), vec![], opts).await.unwrap_err();
   assert_eq!(err.code, "timeout");
 
-  let opts = CallOptions { client_id: Some("c1".into()), ..Default::default() };
+  let opts = CallOptions { client_id: Some("c1".into()), window: Some("main".into()), ..Default::default() };
   let call = sup.call("sleep", json_payload(json!({"ms": 2000})), vec![], opts);
   let cancel = async {
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(sup.cancel("c1"));
+    assert!(sup.cancel("main", "c1"));
   };
   let (result, ()) = tokio::join!(call, cancel);
   assert_eq!(result.unwrap_err().code, "cancelled");

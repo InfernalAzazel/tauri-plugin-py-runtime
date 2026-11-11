@@ -195,6 +195,7 @@ impl Builder {
     self
   }
 
+  /// Default per-call timeout. A frontend `timeoutMs` may raise it up to 10x this value.
   pub fn invoke_timeout(mut self, timeout: Duration) -> Self {
     self.invoke_timeout = Some(timeout);
     self

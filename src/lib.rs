@@ -385,7 +385,7 @@ mod tests {
     let resources = tmp.0.join("resources");
     let err = resolve_script(Path::new("../py/main.py"), Some(&cwd), Some(&resources), true).unwrap_err();
     assert!(err.contains(&cwd.join("../py/main.py").display().to_string()), "{err}");
-    assert!(err.contains(&resources.join("_up_/py/main.py").display().to_string()), "{err}");
+    assert!(err.contains(&resources.join("_up_").join("py").join("main.py").display().to_string()), "{err}");
   }
 
   #[test]

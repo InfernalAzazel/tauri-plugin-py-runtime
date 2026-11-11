@@ -1,0 +1,25 @@
+{
+  "name": "tauri-plugin-py-runtime-api",
+  "version": "0.1.0",
+  "description": "Frontend API for tauri-plugin-py-runtime",
+  "type": "module",
+  "main": "./dist-js/index.js",
+  "types": "./dist-js/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist-js/index.d.ts",
+      "import": "./dist-js/index.js"
+    }
+  },
+  "files": ["dist-js", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "peerDependencies": {
+    "@tauri-apps/api": "^2.0.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "typescript": "~5.6.0"
+  }
+}

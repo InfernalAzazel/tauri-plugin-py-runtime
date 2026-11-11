@@ -5,7 +5,7 @@ import time
 import pytest
 
 from tauri_runtime import App, Channel, Command, Event, Raw, TauriError
-from tauri_runtime.protocol import PROTOCOL_VERSION, Kind
+from tauri_runtime.protocol import PROTOCOL_VERSION, Kind, encode
 
 
 def base_app():
@@ -202,3 +202,89 @@ def test_registration_errors():
 
         @app.command("hello")
         async def again() -> None: ...
+
+
+def test_malformed_event_dropped_hello_still_works(harness):
+    app = base_app()
+
+    @app.listen("e")
+    async def on_e(event: Event):
+        raise AssertionError("listener should not run")
+
+    h = harness(app)
+    h.send(Kind.EVENT, {"event": "e", "encoding": "json"}, b"{not json")
+    h.request(1, "hello", {"name": "Ky"})
+    f = h.recv()
+    assert f.kind == Kind.RESPONSE
+    assert json.loads(f.body) == "Hello Ky"
+
+
+def test_request_without_id_dropped_hello_still_works(harness):
+    h = harness(base_app())
+    h.send(Kind.REQUEST, {"cmd": "hello", "encoding": "json", "window": "main"}, b'{"name":"x"}')
+    h.request(1, "hello", {"name": "Ky"})
+    f = h.recv()
+    assert f.kind == Kind.RESPONSE
+    assert json.loads(f.body) == "Hello Ky"
+
+
+def test_invalid_json_body_invalid_args(harness):
+    h = harness(base_app())
+    h.send(
+        Kind.REQUEST,
+        {"id": 1, "cmd": "hello", "encoding": "json", "window": "main"},
+        b"{bad",
+    )
+    f = h.recv()
+    assert f.kind == Kind.ERROR
+    assert f.header["code"] == "invalid_args"
+    assert "invalid request body" in f.header["message"]
+
+
+def test_handler_cancelled_error_returns_cancelled(harness):
+    app = App(stdio=False)
+
+    @app.command
+    async def bail() -> None:
+        raise asyncio.CancelledError()
+
+    h = harness(app)
+    h.request(1, "bail")
+    f = h.recv()
+    assert f.kind == Kind.ERROR
+    assert f.header == {"id": 1, "code": "cancelled", "message": "command was cancelled"}
+
+
+def test_duplicate_call_id(harness):
+    app = base_app()
+
+    @app.command
+    async def linger() -> str:
+        await asyncio.sleep(10)
+        return "done"
+
+    h = harness(app)
+    h.request(1, "linger")
+    h.request(1, "hello", {"name": "x"})
+    f = h.recv()
+    assert f.kind == Kind.ERROR
+    assert f.header["id"] == 1
+    assert f.header["code"] == "invalid_args"
+    assert "duplicate call id" in f.header["message"]
+    h.send(Kind.CANCEL, {"id": 1, "reason": "client"})
+    h.request(2, "hello", {"name": "ok"})
+    f2 = h.recv()
+    assert f2.kind == Kind.RESPONSE
+    assert json.loads(f2.body) == "Hello ok"
+
+
+def test_truncated_frame_exit_code_2(harness):
+    from tauri_runtime.protocol import Frame
+
+    h = harness(base_app())
+    partial = encode(Frame(Kind.REQUEST, {"id": 1, "cmd": "hello", "encoding": "none"}, b""))[:6]
+    h._to_app.write(partial)
+    h._to_app.flush()
+    h._to_app.close()
+    h.thread.join(5)
+    assert h.exit_code == 2

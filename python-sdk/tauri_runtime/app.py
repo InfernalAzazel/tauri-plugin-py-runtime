@@ -20,6 +20,7 @@ from .protocol import (
     FrameTooLarge,
     Kind,
     MalformedFrame,
+    ProtocolError,
     Raw,
     Writer,
     decode_payload,
@@ -33,6 +34,12 @@ LIFECYCLE = ("startup", "ready", "shutdown")
 
 
 class App:
+    """Tauri Python sidecar runtime.
+
+    Cancelled synchronous handlers keep running in their worker thread until they
+    return; Python cannot interrupt arbitrary thread work.
+    """
+
     def __init__(self, *, stdio: bool = True, max_workers: int | None = None) -> None:
         self._router = Router()
         self._events = EventBus()
@@ -44,6 +51,7 @@ class App:
         self._executor: ThreadPoolExecutor | None = None
         self._calls: dict[int, tuple[asyncio.Future[Any], Command]] = {}
         self._background: set[asyncio.Future[Any]] = set()
+        self._protocol_error = False
 
     # registration -------------------------------------------------------
 
@@ -88,13 +96,18 @@ class App:
         if self._stdio is None:
             raise RuntimeError("App(stdio=False) must be driven with serve()")
         reader, writer = self._stdio
-        sys.exit(asyncio.run(self.serve(reader, writer)))
+        code = asyncio.run(self.serve(reader, writer))
+        sys.stderr.flush()
+        writer.flush()
+        os._exit(code)
 
     async def serve(self, reader: BinaryIO, writer: BinaryIO) -> int:
         self._loop = asyncio.get_running_loop()
         self._writer = Writer(writer)
         self._executor = ThreadPoolExecutor(self._max_workers, thread_name_prefix="tauri-runtime")
+        self._protocol_error = False
         queue: asyncio.Queue[Frame | None] = asyncio.Queue()
+        shutdown_timeout_s = 3.0
         try:
             try:
                 await self._run_hooks("startup")
@@ -107,11 +120,15 @@ class App:
             threading.Thread(target=self._read_loop, args=(reader, queue), name="tauri-runtime-reader", daemon=True).start()
             while (frame := await queue.get()) is not None:
                 if frame.kind == Kind.SHUTDOWN:
+                    shutdown_timeout_s = frame.header.get("timeoutMs", 3000) / 1000.0
                     break
-                self._dispatch(frame)
+                try:
+                    self._dispatch(frame)
+                except Exception as e:
+                    print(f"[WARN] dropped {frame.kind.name} frame: {e}", file=sys.stderr)
             await self._stop_tasks()
-            await self._run_hooks_logged("shutdown")
-            return 0
+            await self._run_hooks_logged("shutdown", timeout=shutdown_timeout_s)
+            return 2 if self._protocol_error else 0
         finally:
             self._executor.shutdown(wait=False, cancel_futures=True)
             self._writer = None
@@ -136,6 +153,12 @@ class App:
                 if frame is None:
                     break
                 put(frame)
+        except ProtocolError as e:
+            self._protocol_error = True
+            print(f"[WARN] protocol error: {e}", file=sys.stderr)
+        except OSError as e:
+            self._protocol_error = True
+            print(f"[WARN] read error: {e}", file=sys.stderr)
         except Exception:
             traceback.print_exc()
         finally:
@@ -171,9 +194,14 @@ class App:
         for func in self._hooks[hook]:
             await self._invoke(func)
 
-    async def _run_hooks_logged(self, hook: str) -> None:
+    async def _run_hooks_logged(self, hook: str, timeout: float | None = None) -> None:
         try:
-            await self._run_hooks(hook)
+            if timeout is not None:
+                await asyncio.wait_for(self._run_hooks(hook), timeout=timeout)
+            else:
+                await self._run_hooks(hook)
+        except asyncio.TimeoutError:
+            print("[WARN] shutdown hooks timed out", file=sys.stderr)
         except Exception:
             traceback.print_exc()
 
@@ -188,11 +216,24 @@ class App:
     # calls --------------------------------------------------------------
 
     def _start_call(self, frame: Frame) -> None:
-        call_id = frame.header["id"]
+        call_id = frame.header.get("id")
+        if not isinstance(call_id, int):
+            print("[WARN] dropped REQUEST frame: missing or invalid id", file=sys.stderr)
+            return
+        if call_id in self._calls:
+            ctx = Command(id=call_id, cmd=frame.header.get("cmd", ""), window=frame.header.get("window"))
+            self._send_error(ctx, "invalid_args", f"duplicate call id {call_id}")
+            return
         ctx = Command(id=call_id, cmd=frame.header.get("cmd", ""), window=frame.header.get("window"))
         task = self._spawn(self._handle_call(ctx, frame))
         self._calls[call_id] = (task, ctx)
-        task.add_done_callback(lambda _: self._calls.pop(call_id, None))
+
+        def on_done(t: asyncio.Future[Any]) -> None:
+            entry = self._calls.get(call_id)
+            if entry is not None and entry[0] is t:
+                self._calls.pop(call_id, None)
+
+        task.add_done_callback(on_done)
 
     def _cancel_call(self, call_id: Any) -> None:
         entry = self._calls.pop(call_id, None)
@@ -209,7 +250,8 @@ class App:
                 encoding, body = encode_payload(result)
                 self._send(Frame(Kind.RESPONSE, {"id": ctx.id, "encoding": encoding}, body))
         except asyncio.CancelledError:
-            pass
+            if not ctx.cancelled:
+                self._send_error(ctx, "cancelled", "command was cancelled")
         except TauriError as e:
             self._send_error(ctx, e.code, e.message, e.data)
         except FrameTooLarge as e:
@@ -227,7 +269,10 @@ class App:
         handler = self._router.get(ctx.cmd)
         if handler is None:
             raise TauriError("command_not_found", f"command '{ctx.cmd}' not found")
-        payload = decode_payload(frame.header.get("encoding", "none"), frame.body)
+        try:
+            payload = decode_payload(frame.header.get("encoding", "none"), frame.body)
+        except (ValueError, ProtocolError) as e:
+            raise TauriError("invalid_args", f"invalid request body: {e}") from e
         raw = payload if isinstance(payload, Raw) else None
         args = None if raw is not None else payload
         assert self._writer is not None
@@ -251,9 +296,14 @@ class App:
     # events -------------------------------------------------------------
 
     def _deliver_event(self, frame: Frame) -> None:
+        try:
+            payload = decode_payload(frame.header.get("encoding", "none"), frame.body)
+        except (ValueError, ProtocolError) as e:
+            print(f"[WARN] dropped event frame: {e}", file=sys.stderr)
+            return
         event = Event(
             frame.header.get("event", ""),
-            decode_payload(frame.header.get("encoding", "none"), frame.body),
+            payload,
             frame.header.get("window"),
         )
         for func in self._events.get(event.name):

@@ -1,10 +1,13 @@
 ## Default Permission
 
-Default permissions for the plugin
+Allows calling Python commands, exchanging events and reading the runtime status
 
 #### This default permission set includes the following:
 
-- `allow-ping`
+- `allow-invoke`
+- `allow-cancel`
+- `allow-emit`
+- `allow-status`
 
 ## Permission Table
 
@@ -18,12 +21,12 @@ Default permissions for the plugin
 <tr>
 <td>
 
-`py-runtime:allow-ping`
+`py-runtime:allow-cancel`
 
 </td>
 <td>
 
-Enables the ping command without any pre-configured scope.
+Enables the cancel command without any pre-configured scope.
 
 </td>
 </tr>
@@ -31,12 +34,90 @@ Enables the ping command without any pre-configured scope.
 <tr>
 <td>
 
-`py-runtime:deny-ping`
+`py-runtime:deny-cancel`
 
 </td>
 <td>
 
-Denies the ping command without any pre-configured scope.
+Denies the cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`py-runtime:allow-emit`
+
+</td>
+<td>
+
+Enables the emit command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`py-runtime:deny-emit`
+
+</td>
+<td>
+
+Denies the emit command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`py-runtime:allow-invoke`
+
+</td>
+<td>
+
+Enables the invoke command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`py-runtime:deny-invoke`
+
+</td>
+<td>
+
+Denies the invoke command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`py-runtime:allow-status`
+
+</td>
+<td>
+
+Enables the status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`py-runtime:deny-status`
+
+</td>
+<td>
+
+Denies the status command without any pre-configured scope.
 
 </td>
 </tr>

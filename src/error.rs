@@ -1,7 +1,6 @@
 use serde::Serialize;
 use serde_json::Value;
 
-#[allow(dead_code)]
 pub mod codes {
   pub const COMMAND_NOT_FOUND: &str = "command_not_found";
   pub const INVALID_ARGS: &str = "invalid_args";

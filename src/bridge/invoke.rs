@@ -1,5 +1,5 @@
 use std::{
-  collections::HashMap,
+  collections::{BTreeMap, HashMap},
   sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
@@ -7,12 +7,12 @@ use std::{
   time::Duration,
 };
 
-use serde_json::{json, Map, Value};
 use tokio::sync::oneshot;
 
 use crate::{
   bridge::{
-    protocol::{Frame, FrameKind, Payload},
+    header,
+    protocol::{Frame, FrameKind, Payload, ProtocolError},
     transport::Writer,
   },
   error::{codes, Error, Result},
@@ -54,7 +54,7 @@ pub struct Bridge {
 }
 
 fn cancel_frame(id: u64, reason: &str) -> Frame {
-  Frame::new(FrameKind::Cancel, json!({ "id": id, "reason": reason }))
+  Frame::new(FrameKind::Cancel, &header::Cancel { id, reason: reason.into() })
 }
 
 impl Bridge {
@@ -86,14 +86,14 @@ impl Bridge {
       }
       clients.insert(key.clone(), id);
     }
-    let mut channel_ids = Map::new();
+    let mut channel_ids = BTreeMap::new();
     let mut registered = Vec::with_capacity(channels.len());
     {
       let mut map = self.channels.lock().unwrap();
       for (name, sink) in channels {
         let channel_id = self.next_channel.fetch_add(1, Ordering::Relaxed) + 1;
         map.insert(channel_id, sink);
-        channel_ids.insert(name, json!(channel_id));
+        channel_ids.insert(name, channel_id);
         registered.push(channel_id);
       }
     }
@@ -101,14 +101,8 @@ impl Bridge {
     let (tx, rx) = oneshot::channel();
     self.pending.lock().unwrap().insert(id, Pending { tx, channels: registered, client });
 
-    let mut header = json!({ "id": id, "cmd": cmd });
-    if !channel_ids.is_empty() {
-      header["channels"] = Value::Object(channel_ids);
-    }
-    if let Some(window) = &opts.window {
-      header["window"] = json!(window);
-    }
-    if let Err(e) = writer.send(Frame::with_payload(FrameKind::Request, header, args)) {
+    let header = header::Request { id, cmd: cmd.into(), channels: channel_ids, window: opts.window.clone() };
+    if let Err(e) = writer.send(Frame::with_payload(FrameKind::Request, &header, args)) {
       self.finish(id);
       return Err(e);
     }
@@ -159,49 +153,44 @@ impl Bridge {
   }
 
   pub fn handle(&self, frame: Frame, sink: &dyn EventSink) {
+    if let Err(e) = self.dispatch(frame, sink) {
+      log::warn!(target: "py-runtime", "dropped frame from python: {e}");
+    }
+  }
+
+  fn dispatch(&self, frame: Frame, sink: &dyn EventSink) -> std::result::Result<(), ProtocolError> {
     match frame.kind {
       FrameKind::Response => {
-        let Some(id) = frame.header_u64("id") else { return };
+        let header::Response { id } = frame.header()?;
         if let Some(pending) = self.finish(id) {
           let _ = pending.tx.send(frame.into_payload().map_err(Error::from));
         }
       }
       FrameKind::Error => {
-        let Some(id) = frame.header_u64("id") else { return };
+        let header::Error { id, code, message, data } = frame.header()?;
         if let Some(pending) = self.finish(id) {
-          let error = Error {
-            code: frame.header_str("code").unwrap_or(codes::INTERNAL).to_string(),
-            message: frame.header_str("message").unwrap_or_default().to_string(),
-            data: frame.header.get("data").cloned(),
-          };
-          let _ = pending.tx.send(Err(error));
+          let code = code.unwrap_or_else(|| codes::INTERNAL.into());
+          let _ = pending.tx.send(Err(Error { code, message: message.unwrap_or_default(), data }));
         }
       }
       FrameKind::Event => {
-        let event = frame.header_str("event").unwrap_or_default().to_string();
-        let target = frame.header_str("target").map(str::to_owned);
-        match frame.into_payload() {
-          Ok(payload) => sink.emit(&event, target.as_deref(), payload),
-          Err(e) => log::warn!(target: "py-runtime", "dropped event {event}: {e}"),
-        }
+        let header::Event { event, target, .. } = frame.header()?;
+        sink.emit(&event, target.as_deref(), frame.into_payload()?);
       }
       FrameKind::ChannelData => {
-        let Some(channel_id) = frame.header_u64("channel") else { return };
-        let channel = self.channels.lock().unwrap().get(&channel_id).cloned();
+        let header::Channel { channel } = frame.header()?;
+        let channel = self.channels.lock().unwrap().get(&channel).cloned();
         if let Some(channel) = channel {
-          match frame.into_payload() {
-            Ok(payload) => channel(payload),
-            Err(e) => log::warn!(target: "py-runtime", "dropped channel message: {e}"),
-          }
+          channel(frame.into_payload()?);
         }
       }
       FrameKind::ChannelClose => {
-        if let Some(channel_id) = frame.header_u64("channel") {
-          self.channels.lock().unwrap().remove(&channel_id);
-        }
+        let header::Channel { channel } = frame.header()?;
+        self.channels.lock().unwrap().remove(&channel);
       }
       other => log::warn!(target: "py-runtime", "unexpected frame from python: {other:?}"),
     }
+    Ok(())
   }
 
   pub fn fail_all(&self, code: &str, message: &str) {
@@ -218,6 +207,7 @@ impl Bridge {
 mod tests {
   use super::*;
   use crate::bridge::protocol::DEFAULT_MAX_FRAME_SIZE;
+  use serde_json::json;
   use tokio::sync::mpsc::UnboundedReceiver;
 
   struct NullSink;
@@ -245,7 +235,7 @@ mod tests {
   }
 
   fn response(id: u64, payload: Payload) -> Frame {
-    Frame::with_payload(FrameKind::Response, json!({ "id": id }), payload)
+    Frame::with_payload(FrameKind::Response, &json!({ "id": id }), payload)
   }
 
   #[tokio::test]
@@ -254,9 +244,9 @@ mod tests {
     let call = spawn_call(&bridge, &writer, "hello", CallOptions { window: Some("main".into()), ..Default::default() }, vec![]);
     let req = rx.recv().await.unwrap();
     assert_eq!(req.kind, FrameKind::Request);
-    assert_eq!(req.header_str("cmd"), Some("hello"));
-    assert_eq!(req.header_str("window"), Some("main"));
-    bridge.handle(response(req.header_u64("id").unwrap(), Payload::Json("\"hi\"".into())), &NullSink);
+    assert_eq!(req.header["cmd"], "hello");
+    assert_eq!(req.header["window"], "main");
+    bridge.handle(response(req.header["id"].as_u64().unwrap(), Payload::Json("\"hi\"".into())), &NullSink);
     assert_eq!(call.await.unwrap().unwrap(), Payload::Json("\"hi\"".into()));
   }
 
@@ -264,9 +254,9 @@ mod tests {
   async fn out_of_order_responses() {
     let (bridge, writer, mut rx) = setup();
     let first = spawn_call(&bridge, &writer, "a", CallOptions::default(), vec![]);
-    let id_a = rx.recv().await.unwrap().header_u64("id").unwrap();
+    let id_a = rx.recv().await.unwrap().header["id"].as_u64().unwrap();
     let second = spawn_call(&bridge, &writer, "b", CallOptions::default(), vec![]);
-    let id_b = rx.recv().await.unwrap().header_u64("id").unwrap();
+    let id_b = rx.recv().await.unwrap().header["id"].as_u64().unwrap();
     bridge.handle(response(id_b, Payload::Json("2".into())), &NullSink);
     assert_eq!(second.await.unwrap().unwrap(), Payload::Json("2".into()));
     bridge.handle(response(id_a, Payload::Json("1".into())), &NullSink);
@@ -274,12 +264,24 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn frames_missing_required_fields_are_dropped() {
+    let (bridge, writer, mut rx) = setup();
+    let call = spawn_call(&bridge, &writer, "x", CallOptions::default(), vec![]);
+    let id = rx.recv().await.unwrap().header["id"].as_u64().unwrap();
+    bridge.handle(Frame::new(FrameKind::Response, &json!({"id": "nope"})), &NullSink);
+    bridge.handle(Frame::new(FrameKind::Error, &json!({"code": "x"})), &NullSink);
+    bridge.handle(Frame::new(FrameKind::ChannelData, &json!({})), &NullSink);
+    bridge.handle(response(id, Payload::Json("1".into())), &NullSink);
+    assert_eq!(call.await.unwrap().unwrap(), Payload::Json("1".into()));
+  }
+
+  #[tokio::test]
   async fn error_frame_maps_to_error() {
     let (bridge, writer, mut rx) = setup();
     let call = spawn_call(&bridge, &writer, "x", CallOptions::default(), vec![]);
-    let id = rx.recv().await.unwrap().header_u64("id").unwrap();
+    let id = rx.recv().await.unwrap().header["id"].as_u64().unwrap();
     bridge.handle(
-      Frame::new(FrameKind::Error, json!({"id": id, "code": "custom", "message": "bad", "data": {"k": 1}})),
+      Frame::new(FrameKind::Error, &json!({"id": id, "code": "custom", "message": "bad", "data": {"k": 1}})),
       &NullSink,
     );
     let err = call.await.unwrap().unwrap_err();
@@ -291,12 +293,12 @@ mod tests {
     let (bridge, writer, mut rx) = setup();
     let opts = CallOptions { timeout: Some(Duration::from_millis(50)), ..Default::default() };
     let call = spawn_call(&bridge, &writer, "slow", opts, vec![]);
-    let id = rx.recv().await.unwrap().header_u64("id").unwrap();
+    let id = rx.recv().await.unwrap().header["id"].as_u64().unwrap();
     assert_eq!(call.await.unwrap().unwrap_err().code, codes::TIMEOUT);
     let cancel = rx.recv().await.unwrap();
     assert_eq!(cancel.kind, FrameKind::Cancel);
-    assert_eq!(cancel.header_u64("id"), Some(id));
-    assert_eq!(cancel.header_str("reason"), Some("timeout"));
+    assert_eq!(cancel.header["id"], id);
+    assert_eq!(cancel.header["reason"], "timeout");
   }
 
   fn client_opts(window: &str, client_id: &str) -> CallOptions {
@@ -312,14 +314,14 @@ mod tests {
     assert!(bridge.cancel(Some(&writer), "main", "c1"));
     assert!(!bridge.cancel(Some(&writer), "main", "c1"));
     assert_eq!(call.await.unwrap().unwrap_err().code, codes::CANCELLED);
-    assert_eq!(rx.recv().await.unwrap().header_str("reason"), Some("client"));
+    assert_eq!(rx.recv().await.unwrap().header["reason"], "client");
   }
 
   #[tokio::test]
   async fn duplicate_pending_client_id_is_rejected() {
     let (bridge, writer, mut rx) = setup();
     let first = spawn_call(&bridge, &writer, "slow", client_opts("main", "c1"), vec![]);
-    let id = rx.recv().await.unwrap().header_u64("id").unwrap();
+    let id = rx.recv().await.unwrap().header["id"].as_u64().unwrap();
     let dup = spawn_call(&bridge, &writer, "slow", client_opts("main", "c1"), vec![]);
     assert_eq!(dup.await.unwrap().unwrap_err().code, codes::INVALID_ARGS);
     assert!(rx.try_recv().is_err(), "duplicate call must not reach python");
@@ -335,15 +337,15 @@ mod tests {
   async fn same_client_id_in_different_windows_is_independent() {
     let (bridge, writer, mut rx) = setup();
     let a = spawn_call(&bridge, &writer, "slow", client_opts("a", "c1"), vec![]);
-    let id_a = rx.recv().await.unwrap().header_u64("id").unwrap();
+    let id_a = rx.recv().await.unwrap().header["id"].as_u64().unwrap();
     let b = spawn_call(&bridge, &writer, "slow", client_opts("b", "c1"), vec![]);
-    let id_b = rx.recv().await.unwrap().header_u64("id").unwrap();
+    let id_b = rx.recv().await.unwrap().header["id"].as_u64().unwrap();
     assert!(bridge.cancel(Some(&writer), "b", "c1"));
     assert_eq!(b.await.unwrap().unwrap_err().code, codes::CANCELLED);
-    assert_eq!(rx.recv().await.unwrap().header_u64("id"), Some(id_b));
+    assert_eq!(rx.recv().await.unwrap().header["id"], id_b);
     assert!(bridge.cancel(Some(&writer), "a", "c1"));
     assert_eq!(a.await.unwrap().unwrap_err().code, codes::CANCELLED);
-    assert_eq!(rx.recv().await.unwrap().header_u64("id"), Some(id_a));
+    assert_eq!(rx.recv().await.unwrap().header["id"], id_a);
   }
 
   #[test]
@@ -381,9 +383,9 @@ mod tests {
     let sink: ChannelSink = Arc::new(move |p| sink_store.lock().unwrap().push(p));
     let call = spawn_call(&bridge, &writer, "count", CallOptions::default(), vec![("onItem".into(), sink)]);
     let req = rx.recv().await.unwrap();
-    let id = req.header_u64("id").unwrap();
+    let id = req.header["id"].as_u64().unwrap();
     let channel_id = req.header["channels"]["onItem"].as_u64().unwrap();
-    let data = |n: &str| Frame::with_payload(FrameKind::ChannelData, json!({"channel": channel_id}), Payload::Json(n.into()));
+    let data = |n: &str| Frame::with_payload(FrameKind::ChannelData, &json!({"channel": channel_id}), Payload::Json(n.into()));
     bridge.handle(data("0"), &NullSink);
     bridge.handle(data("1"), &NullSink);
     bridge.handle(response(id, Payload::None), &NullSink);

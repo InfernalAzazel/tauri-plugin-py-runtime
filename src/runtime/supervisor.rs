@@ -5,12 +5,12 @@ use std::{
 
 use futures_util::StreamExt;
 use serde::Serialize;
-use serde_json::json;
 use tokio::sync::watch;
 use tokio_util::{codec::FramedRead, sync::CancellationToken};
 
 use crate::{
   bridge::{
+    header,
     protocol::{FrameCodec, PROTOCOL_VERSION},
     Bridge, CallOptions, ChannelSink, EventSink, Frame, FrameKind, Payload, Writer,
   },
@@ -29,26 +29,15 @@ enum Exit {
   Crashed { code: Option<i32>, uptime: Duration },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::IntoStaticStr, strum::AsRefStr)]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum Status {
   Starting,
   Running,
   Crashed,
   Stopped,
   Failed,
-}
-
-impl Status {
-  pub fn as_str(self) -> &'static str {
-    match self {
-      Self::Starting => "starting",
-      Self::Running => "running",
-      Self::Crashed => "crashed",
-      Self::Stopped => "stopped",
-      Self::Failed => "failed",
-    }
-  }
 }
 
 #[derive(Debug, Clone)]
@@ -156,11 +145,11 @@ impl Supervisor {
       _ = self.stop.cancelled() => return self.stop_child(child).await,
     };
     let failure = match handshake {
-      Ok(Some(Ok(Ok(hello)))) if hello.kind == FrameKind::Hello => match hello.header_u64("protocol") {
-        Some(PROTOCOL_VERSION) => None,
+      Ok(Some(Ok(Ok(hello)))) if hello.kind == FrameKind::Hello => match hello.header::<header::Hello>().ok() {
+        Some(header::Hello { protocol: PROTOCOL_VERSION }) => None,
         other => Some((
           codes::PROTOCOL_MISMATCH,
-          format!("python sdk speaks protocol {other:?}, expected {PROTOCOL_VERSION}"),
+          format!("python sdk speaks protocol {:?}, expected {PROTOCOL_VERSION}", other.map(|h| h.protocol)),
         )),
       },
       Ok(Some(Ok(Ok(frame)))) => Some((codes::RUNTIME_UNAVAILABLE, format!("expected Hello, got {:?}", frame.kind))),
@@ -174,11 +163,8 @@ impl Supervisor {
       return Exit::Failed;
     }
 
-    let ready = json!({
-      "protocol": PROTOCOL_VERSION,
-      "app": { "name": self.config.app_name, "version": self.config.app_version },
-    });
-    let _ = writer.send(Frame::new(FrameKind::Ready, ready));
+    let app = header::AppInfo { name: self.config.app_name.clone(), version: self.config.app_version.clone() };
+    let _ = writer.send(Frame::new(FrameKind::Ready, &header::Ready { protocol: PROTOCOL_VERSION, app }));
     *self.writer.lock().unwrap() = Some(writer);
     // Checked after publishing the writer: a concurrent shutdown either took it (and sent
     // Shutdown) or cancelled `stop` before we got here.
@@ -267,7 +253,7 @@ impl Supervisor {
           return error;
         }
       }
-      Error::new(codes::RUNTIME_UNAVAILABLE, format!("python runtime is {}", status.as_str()))
+      Error::new(codes::RUNTIME_UNAVAILABLE, format!("python runtime is {}", status.as_ref()))
     })
   }
 
@@ -294,11 +280,8 @@ impl Supervisor {
       .unwrap()
       .clone()
       .ok_or_else(|| Error::new(codes::RUNTIME_UNAVAILABLE, "python runtime is not running"))?;
-    let mut header = json!({ "event": event });
-    if let Some(window) = window {
-      header["window"] = json!(window);
-    }
-    writer.send(Frame::with_payload(FrameKind::Event, header, payload))
+    let header = header::Event { event: event.into(), target: None, window: window.map(Into::into) };
+    writer.send(Frame::with_payload(FrameKind::Event, &header, payload))
   }
 
   pub async fn shutdown(&self) {
@@ -308,7 +291,7 @@ impl Supervisor {
     match writer {
       Some(writer) => {
         let timeout_ms = self.config.shutdown_timeout.as_millis() as u64;
-        let _ = writer.send(Frame::new(FrameKind::Shutdown, json!({ "timeoutMs": timeout_ms })));
+        let _ = writer.send(Frame::new(FrameKind::Shutdown, &header::Shutdown { timeout_ms }));
       }
       None if !matches!(self.status(), Status::Starting | Status::Running) => return,
       None => {}

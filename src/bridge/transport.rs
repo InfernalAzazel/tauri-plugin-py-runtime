@@ -63,11 +63,11 @@ mod tests {
     let writer = Writer::spawn(a, DEFAULT_MAX_FRAME_SIZE);
     let mut frames = FramedRead::new(b, FrameCodec::new(DEFAULT_MAX_FRAME_SIZE));
     for i in 0..3u64 {
-      writer.send(Frame::new(FrameKind::Event, json!({"i": i}))).unwrap();
+      writer.send(Frame::new(FrameKind::Event, &json!({"i": i}))).unwrap();
     }
     for i in 0..3u64 {
       let frame = frames.next().await.unwrap().unwrap().unwrap();
-      assert_eq!(frame.header_u64("i"), Some(i));
+      assert_eq!(frame.header["i"], i);
     }
   }
 
@@ -75,7 +75,7 @@ mod tests {
   fn rejects_oversized_frames() {
     let (writer, _rx) = Writer::channel(16);
     let err = writer
-      .send(Frame::with_payload(FrameKind::Event, json!({}), Payload::Raw(vec![0; 100])))
+      .send(Frame::with_payload(FrameKind::Event, &json!({}), Payload::Raw(vec![0; 100])))
       .unwrap_err();
     assert_eq!(err.code, "frame_too_large");
   }
@@ -84,6 +84,6 @@ mod tests {
   fn send_after_close_is_unavailable() {
     let (writer, rx) = Writer::channel(1024);
     drop(rx);
-    assert_eq!(writer.send(Frame::new(FrameKind::Event, json!({}))).unwrap_err().code, "runtime_unavailable");
+    assert_eq!(writer.send(Frame::new(FrameKind::Event, &json!({}))).unwrap_err().code, "runtime_unavailable");
   }
 }

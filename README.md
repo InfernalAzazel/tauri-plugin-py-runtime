@@ -6,11 +6,12 @@ calls, events and streams between the frontend and Python.
 | Part | Package |
 | --- | --- |
 | Rust plugin | `tauri-plugin-py-runtime` (plugin name `py-runtime`) |
-| Python SDK | `tauri-runtime` on PyPI, imported as `tauri_runtime` (Python ≥ 3.10, no dependencies; `pydantic` optional) |
+| Python SDK | `tauri-runtime` on PyPI, imported as `tauri_runtime` (Python ≥ 3.10, requires `pydantic>=2.9`) |
 | Frontend API | `tauri-plugin-py-runtime-api` |
 
 The Rust side and Python talk over the child process's stdin/stdout using a small
-length-prefixed binary protocol (protocol version 1, frames up to 64 MiB).
+length-prefixed protocol of JSON messages (protocol version 2, frames up to 64 MiB, see
+[Protocol](#protocol)).
 
 ## Python
 
@@ -32,8 +33,8 @@ app.run()
 
 - `async def` commands run on the event loop; plain `def` commands run in a thread pool.
 - Parameters are filled from the JSON arguments (camelCase keys are mapped to snake_case).
-  Missing required parameters fail with `invalid_args`. If `pydantic` is installed, annotated
-  parameters are validated with it (`invalid_args` with the validation errors as `data`).
+  Missing required parameters fail with `invalid_args`. Annotated parameters are validated with
+  pydantic (`invalid_args` with the validation errors as `data`).
 - Annotate a parameter with `Raw`, `Channel[T]`, `Command` or `App` to receive those instead
   of a JSON value:
   - `Raw` – the raw request body (`data.bytes`) when the frontend passes a `Uint8Array` / `ArrayBuffer`.
@@ -42,7 +43,7 @@ app.run()
     plain `def` command). A channel is only valid until the command returns.
   - `Command` – call context: `id`, `cmd`, `window` (label of the calling webview), `cancelled`.
   - `App` – the app instance.
-- Return any JSON-serializable value (dataclasses and pydantic models are supported).
+- Return any value pydantic can serialize to JSON (including dataclasses and pydantic models).
   Return `Raw(...)` or `bytes` to send binary data; the frontend receives a `Uint8Array`.
   `NaN` and `±Infinity` are not valid JSON and are rejected: returning them fails the call
   with `internal` (sending them on a channel or with `emit` raises `ValueError`).
@@ -138,10 +139,13 @@ Add `"py-runtime:default"` to your capability. It allows `invoke`, `cancel`, `em
 - If nothing is found, plugin setup fails with an error listing every path that was tried.
 - Python runs with the script's directory as its working directory.
 
-> This phase does not package a Python interpreter or your dependencies. The example app points
-> `PYTHONPATH` at the in-repo SDK with an absolute, compile-time path
-> (`concat!(env!("CARGO_MANIFEST_DIR"), "/../../../python-sdk")`), which only works on the
-> machine that built it. Bundling Python and dependencies (uv / Nuitka) is planned for phase 5.
+> This phase does not package a Python interpreter or your dependencies: the interpreter you
+> configure must have `tauri-runtime` (and therefore `pydantic`) importable. The example app runs
+> the in-repo SDK's venv (`python-sdk/.venv`, created by `uv sync`, which installs the SDK in
+> editable mode) via an absolute, compile-time path
+> (`concat!(env!("CARGO_MANIFEST_DIR"), "/../../../python-sdk/.venv/bin/python")`), which only
+> works on the machine that built it. Bundling Python and dependencies (uv / Nuitka) is planned
+> for phase 5.
 
 ## Frontend
 
@@ -235,7 +239,7 @@ Codes raised with `TauriError` in Python are passed through unchanged.
   with exponential backoff: 1 s, 2 s, 4 s … capped at 30 s. The backoff resets once a process
   stayed up for at least 30 s. If a restarted process fails its handshake, restarting stops and
   the status becomes `failed`.
-- On app exit, Rust sends a Shutdown frame with `timeoutMs` (the shutdown timeout). Python
+- On app exit, Rust sends a `shutdown` message with `timeoutMs` (the shutdown timeout). Python
   cancels running calls and runs `shutdown` hooks, all within that one budget (an invalid
   `timeoutMs` or a closed stdin falls back to 3 s), then exits. Handlers that ignore
   cancellation and stuck `def` handlers are abandoned rather than awaited. If the process is
@@ -243,6 +247,36 @@ Codes raised with `TauriError` in Python are passed through unchanged.
 - `app.run()` always ends the process: if an exception escapes (including `sys.exit()` or
   `KeyboardInterrupt` raised from a handler) it flushes output and exits with the
   `sys.exit` code, or 1 for any other exception.
+
+## Protocol
+
+Every frame is `[u32 BE length][u32 BE header length][header JSON][body]`; the outer length
+counts everything after itself and is capped at 64 MiB. The header is one JSON object tagged by
+`type`:
+
+| `type` | Direction | Fields |
+| --- | --- | --- |
+| `hello` | Python → Rust | `protocol`, `sdk`, `commands` |
+| `ready` | Rust → Python | `protocol`, `app: { name, version }` |
+| `shutdown` | Rust → Python | `timeoutMs` |
+| `request` | Rust → Python | `id`, `cmd`, `channels?` (argument name → channel id), `window?`, payload |
+| `response` | Python → Rust | `id`, payload |
+| `error` | Python → Rust | `id`, `code`, `message`, `data?` |
+| `cancel` | Rust → Python | `id`, `reason` (`"client"` or `"timeout"`) |
+| `event` | both | `event`, `target?` (Python → Rust), `window?` (Rust → Python), payload |
+| `channel_data` | Python → Rust | `channel`, payload |
+| `channel_close` | Python → Rust | `channel` |
+
+A payload is either a JSON value inline in the header as `value` (absent means none/`null`), or
+binary data in the frame body with `"raw": true`. The body must be empty unless `raw` is set.
+`NaN` and `±Infinity` are never sent. Unknown header fields are ignored. A frame whose header
+can't be decoded (invalid JSON, unknown `type`, missing or mistyped field) is logged and
+skipped; an oversized frame ends the connection. If the first frame from Python isn't a
+decodable `hello` with the same protocol version, startup fails with `protocol_mismatch`.
+
+The message types are a serde enum on the Rust side (`bridge::protocol::Message`) and pydantic
+models on the Python side (`tauri_runtime.protocol`). `python-sdk/tests/fixtures/golden_frames.json`
+holds one encoded frame per type that both test suites encode and decode byte for byte.
 
 ## Logging
 
@@ -268,7 +302,8 @@ cd examples/vue && pnpm install && pnpm tauri dev
 ## Development
 
 ```bash
-cargo test                              # Rust unit + integration tests
+cd python-sdk && uv sync                # SDK venv, used by the Rust integration tests and the example
+cargo test                              # Rust unit + integration tests ($PYTHON overrides the interpreter)
 cd python-sdk && uv run pytest          # Python SDK tests
 pnpm install && pnpm build              # build guest-js
 ```

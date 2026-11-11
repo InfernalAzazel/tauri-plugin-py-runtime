@@ -98,11 +98,12 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      # 可信发布（OIDC）需要 npm >= 11.5.1，无需令牌；需先在 npm 包设置中添加本工作流为 Trusted Publisher。
+      - name: Update npm
+        run: npm install -g npm@latest
       - name: Install and build
         run: npm install
-      - name: Publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish (trusted publishing)
         run: |
           version="${GITHUB_REF_NAME#v}"
           if npm view "tauri-plugin-py-runtime-api@$version" version >/dev/null 2>&1; then

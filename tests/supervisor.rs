@@ -202,6 +202,25 @@ sys.stdin.read()\n";
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn shutdown_kills_unresponsive_runtime() {
+  let script = "import sys, time\n\
+from tauri_runtime.protocol import Frame, Kind, encode\n\
+sys.stdout.buffer.write(encode(Frame(Kind.HELLO, {'protocol': 1})))\n\
+sys.stdout.buffer.flush()\n\
+time.sleep(60)\n";
+  let mut cfg = config(vec!["-c".into(), script.into()]);
+  cfg.shutdown_timeout = Duration::from_millis(200);
+  let sup = Supervisor::new(cfg, Arc::new(Recorder::default()));
+  sup.start();
+  wait_for(&sup, Status::Running).await;
+  let started = Instant::now();
+  sup.shutdown().await;
+  let elapsed = started.elapsed();
+  assert_eq!(sup.status(), Status::Stopped);
+  assert!(elapsed >= Duration::from_millis(1200) && elapsed < Duration::from_secs(3), "shutdown took {elapsed:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn shutdown_during_startup_stops_runtime() {
   let sup = start(Default::default());
   sup.shutdown().await;

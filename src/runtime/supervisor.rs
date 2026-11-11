@@ -1,16 +1,13 @@
 use std::{
-  sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
-  },
+  sync::{Arc, Mutex},
   time::{Duration, Instant},
 };
 
 use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::json;
-use tokio::sync::{watch, Notify};
-use tokio_util::codec::FramedRead;
+use tokio::sync::watch;
+use tokio_util::{codec::FramedRead, sync::CancellationToken};
 
 use crate::{
   bridge::{
@@ -76,8 +73,10 @@ pub struct Supervisor {
   status: watch::Sender<Status>,
   writer: Mutex<Option<Writer>>,
   last_error: Mutex<Option<Error>>,
-  stopping: AtomicBool,
-  kill: Notify,
+  /// Shutdown requested: python is asked to exit, startup and restart backoff are aborted.
+  stop: CancellationToken,
+  /// Shutdown budget exhausted: the running child is killed.
+  kill: CancellationToken,
 }
 
 impl Supervisor {
@@ -90,8 +89,8 @@ impl Supervisor {
       status,
       writer: Mutex::new(None),
       last_error: Mutex::new(None),
-      stopping: AtomicBool::new(false),
-      kill: Notify::new(),
+      stop: CancellationToken::new(),
+      kill: CancellationToken::new(),
     })
   }
 
@@ -124,10 +123,6 @@ impl Supervisor {
 
       self.sink.exited(code);
       self.status.send_replace(Status::Starting);
-      if self.stopping.load(Ordering::SeqCst) {
-        self.status.send_replace(Status::Stopped);
-        return;
-      }
       crashes = if uptime >= STABLE_UPTIME { 1 } else { crashes + 1 };
       let delay = RESTART_DELAY
         .saturating_mul(1 << (crashes - 1).min(5))
@@ -135,9 +130,9 @@ impl Supervisor {
       log::info!(target: "py-runtime", "restarting python runtime in {delay:?}");
       tokio::select! {
         _ = tokio::time::sleep(delay) => {}
-        _ = self.kill.notified() => {}
+        _ = self.stop.cancelled() => {}
       }
-      if self.stopping.load(Ordering::SeqCst) {
+      if self.stop.is_cancelled() {
         self.status.send_replace(Status::Stopped);
         return;
       }
@@ -158,7 +153,7 @@ impl Supervisor {
 
     let handshake = tokio::select! {
       result = tokio::time::timeout(self.config.handshake_timeout, frames.next()) => result,
-      _ = self.kill.notified() => return self.stop_child(child).await,
+      _ = self.stop.cancelled() => return self.stop_child(child).await,
     };
     let failure = match handshake {
       Ok(Some(Ok(Ok(hello)))) if hello.kind == FrameKind::Hello => match hello.header_u64("protocol") {
@@ -178,9 +173,6 @@ impl Supervisor {
       self.fail(code, &message);
       return Exit::Failed;
     }
-    if self.stopping.load(Ordering::SeqCst) {
-      return self.stop_child(child).await;
-    }
 
     let ready = json!({
       "protocol": PROTOCOL_VERSION,
@@ -188,6 +180,12 @@ impl Supervisor {
     });
     let _ = writer.send(Frame::new(FrameKind::Ready, ready));
     *self.writer.lock().unwrap() = Some(writer);
+    // Checked after publishing the writer: a concurrent shutdown either took it (and sent
+    // Shutdown) or cancelled `stop` before we got here.
+    if self.stop.is_cancelled() {
+      *self.writer.lock().unwrap() = None;
+      return self.stop_child(child).await;
+    }
     self.status.send_replace(Status::Running);
     let running_since = Instant::now();
     log::info!(target: "py-runtime", "python runtime is running");
@@ -204,24 +202,21 @@ impl Supervisor {
           }
           None => break,
         },
-        _ = self.kill.notified() => {
-          let _ = child.kill().await;
-          break;
-        }
+        _ = self.kill.cancelled() => break,
       }
     }
 
     *self.writer.lock().unwrap() = None;
     let exit = tokio::select! {
       status = child.wait() => status.ok(),
-      _ = self.kill.notified() => {
+      _ = self.kill.cancelled() => {
         let _ = child.kill().await;
         child.wait().await.ok()
       }
     };
     let code = exit.and_then(|s| s.code());
 
-    if self.stopping.load(Ordering::SeqCst) {
+    if self.stop.is_cancelled() {
       self.bridge.fail_all(codes::RUNTIME_UNAVAILABLE, "python runtime stopped");
       self.status.send_replace(Status::Stopped);
       log::info!(target: "py-runtime", "python runtime stopped (code {code:?})");
@@ -307,7 +302,7 @@ impl Supervisor {
   }
 
   pub async fn shutdown(&self) {
-    self.stopping.store(true, Ordering::SeqCst);
+    self.stop.cancel();
     let budget = self.config.shutdown_timeout + SHUTDOWN_GRACE;
     let writer = self.writer.lock().unwrap().take();
     match writer {
@@ -315,16 +310,13 @@ impl Supervisor {
         let timeout_ms = self.config.shutdown_timeout.as_millis() as u64;
         let _ = writer.send(Frame::new(FrameKind::Shutdown, json!({ "timeoutMs": timeout_ms })));
       }
-      None => match self.status() {
-        Status::Starting => self.kill.notify_one(),
-        Status::Running => {}
-        _ => return,
-      },
+      None if !matches!(self.status(), Status::Starting | Status::Running) => return,
+      None => {}
     }
 
     if !self.wait_stopped(budget).await {
       log::warn!(target: "py-runtime", "python runtime did not exit in time, killing it");
-      self.kill.notify_one();
+      self.kill.cancel();
       self.wait_stopped(Duration::from_secs(1)).await;
     }
   }

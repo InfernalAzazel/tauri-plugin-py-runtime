@@ -183,5 +183,56 @@ async fn handshake_failure_marks_failed() {
   sup.start();
   let err = sup.call("hello", Payload::None, vec![], CallOptions::default()).await.unwrap_err();
   assert_eq!(err.code, "runtime_unavailable");
+  assert!(err.message.contains("exited before handshake"), "message was {:?}", err.message);
   assert_eq!(sup.status(), Status::Failed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn protocol_mismatch_is_reported() {
+  let script = "import sys\n\
+from tauri_runtime.protocol import Frame, Kind, encode\n\
+sys.stdout.buffer.write(encode(Frame(Kind.HELLO, {'protocol': 99})))\n\
+sys.stdout.buffer.flush()\n\
+sys.stdin.read()\n";
+  let sup = Supervisor::new(config(vec!["-c".into(), script.into()]), Arc::new(Recorder::default()));
+  sup.start();
+  let err = sup.call("hello", Payload::None, vec![], CallOptions::default()).await.unwrap_err();
+  assert_eq!(err.code, "protocol_mismatch", "error was {err:?}");
+  assert_eq!(sup.status(), Status::Failed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_during_startup_stops_runtime() {
+  let sup = start(Default::default());
+  sup.shutdown().await;
+  assert_eq!(sup.status(), Status::Stopped);
+  let err = sup.call("hello", json_payload(json!({"name": "x"})), vec![], CallOptions::default()).await.unwrap_err();
+  assert_eq!(err.code, "runtime_unavailable");
+  tokio::time::sleep(Duration::from_millis(500)).await;
+  assert_eq!(sup.status(), Status::Stopped);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_utf8_stderr_does_not_block() {
+  let sup = start(Default::default());
+  let out = sup.call("noisy", Payload::None, vec![], CallOptions::default()).await.unwrap();
+  assert_eq!(out, Payload::Json("\"ok\"".into()));
+  sup.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_on_crash_recovers() {
+  let recorder = Arc::new(Recorder::default());
+  let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python-sdk/tests/fixtures/echo_app.py");
+  let mut cfg = config(vec![fixture.to_string_lossy().into_owned()]);
+  cfg.restart_on_crash = true;
+  let sup = Supervisor::new(cfg, recorder.clone());
+  sup.start();
+  let err = sup.call("crash", Payload::None, vec![], CallOptions::default()).await.unwrap_err();
+  assert_eq!(err.code, "runtime_exited");
+  let out = sup.call("hello", json_payload(json!({"name": "back"})), vec![], CallOptions::default()).await.unwrap();
+  assert_eq!(out, Payload::Json("\"Hello back\"".into()));
+  assert_eq!(*recorder.exits.lock().unwrap(), vec![Some(3)]);
+  sup.shutdown().await;
+  assert_eq!(sup.status(), Status::Stopped);
 }

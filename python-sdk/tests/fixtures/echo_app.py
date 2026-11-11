@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 
 from tauri_runtime import App, Channel, Event, Raw, TauriError
 
@@ -37,6 +38,14 @@ async def count(n: int, on_item: Channel[int]) -> int:
 @app.command
 async def crash() -> None:
     os._exit(3)
+
+
+@app.command
+def noisy() -> str:
+    for _ in range(2):
+        sys.stderr.buffer.write(b"\xff\xfe not utf8\n" * 20000)
+        sys.stderr.buffer.flush()
+    return "ok"
 
 
 @app.listen("ping")

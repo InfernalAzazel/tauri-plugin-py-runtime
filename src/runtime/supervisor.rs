@@ -3,7 +3,7 @@ use std::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
   },
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 use serde::Serialize;
@@ -23,6 +23,15 @@ use crate::{
 };
 
 const RESTART_DELAY: Duration = Duration::from_secs(1);
+const MAX_RESTART_DELAY: Duration = Duration::from_secs(30);
+const STABLE_UPTIME: Duration = Duration::from_secs(30);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+
+enum Exit {
+  Stopped,
+  Failed,
+  Crashed { code: Option<i32>, uptime: Duration },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -64,6 +73,7 @@ pub struct Supervisor {
   sink: Arc<dyn EventSink>,
   status: watch::Sender<Status>,
   writer: Mutex<Option<Writer>>,
+  last_error: Mutex<Option<Error>>,
   stopping: AtomicBool,
   kill: Notify,
 }
@@ -77,6 +87,7 @@ impl Supervisor {
       sink,
       status,
       writer: Mutex::new(None),
+      last_error: Mutex::new(None),
       stopping: AtomicBool::new(false),
       kill: Notify::new(),
     })
@@ -87,17 +98,56 @@ impl Supervisor {
   }
 
   pub fn start(self: &Arc<Self>) {
+    *self.last_error.lock().unwrap() = None;
     self.status.send_replace(Status::Starting);
     let this = self.clone();
     tauri::async_runtime::spawn(async move { this.run().await });
   }
 
   async fn run(self: Arc<Self>) {
+    let mut crashes = 0u32;
+    loop {
+      let (code, uptime) = match self.run_once().await {
+        Exit::Stopped | Exit::Failed => return,
+        Exit::Crashed { code, uptime } => (code, uptime),
+      };
+      log::error!(target: "py-runtime", "python runtime exited unexpectedly (code {code:?})");
+      self.bridge.fail_all(codes::RUNTIME_EXITED, "python runtime exited");
+
+      if !self.config.restart_on_crash {
+        self.status.send_replace(Status::Crashed);
+        self.sink.exited(code);
+        return;
+      }
+
+      self.sink.exited(code);
+      if self.stopping.load(Ordering::SeqCst) {
+        self.status.send_replace(Status::Stopped);
+        return;
+      }
+      self.status.send_replace(Status::Starting);
+      crashes = if uptime >= STABLE_UPTIME { 1 } else { crashes + 1 };
+      let delay = RESTART_DELAY
+        .saturating_mul(1 << (crashes - 1).min(5))
+        .min(MAX_RESTART_DELAY);
+      log::info!(target: "py-runtime", "restarting python runtime in {delay:?}");
+      tokio::select! {
+        _ = tokio::time::sleep(delay) => {}
+        _ = self.kill.notified() => {}
+      }
+      if self.stopping.load(Ordering::SeqCst) {
+        self.status.send_replace(Status::Stopped);
+        return;
+      }
+    }
+  }
+
+  async fn run_once(&self) -> Exit {
     let Spawned { mut child, stdin, stdout, stderr } = match process::spawn(&self.config.process) {
       Ok(spawned) => spawned,
       Err(e) => {
         self.fail(codes::RUNTIME_UNAVAILABLE, &format!("failed to start python: {e}"));
-        return;
+        return Exit::Failed;
       }
     };
     process::spawn_stderr_logger(stderr);
@@ -105,7 +155,10 @@ impl Supervisor {
     let mut reader = BufReader::new(stdout);
     let max = self.config.max_frame_size;
 
-    let handshake = tokio::time::timeout(self.config.handshake_timeout, read_frame(&mut reader, max)).await;
+    let handshake = tokio::select! {
+      result = tokio::time::timeout(self.config.handshake_timeout, read_frame(&mut reader, max)) => result,
+      _ = self.kill.notified() => return self.stop_child(child).await,
+    };
     let failure = match handshake {
       Ok(Ok(Some(hello))) if hello.kind == FrameKind::Hello => match hello.header_u64("protocol") {
         Some(PROTOCOL_VERSION) => None,
@@ -122,7 +175,10 @@ impl Supervisor {
     if let Some((code, message)) = failure {
       let _ = child.kill().await;
       self.fail(code, &message);
-      return;
+      return Exit::Failed;
+    }
+    if self.stopping.load(Ordering::SeqCst) {
+      return self.stop_child(child).await;
     }
 
     let ready = json!({
@@ -132,6 +188,7 @@ impl Supervisor {
     let _ = writer.send(Frame::new(FrameKind::Ready, ready));
     *self.writer.lock().unwrap() = Some(writer);
     self.status.send_replace(Status::Running);
+    let running_since = Instant::now();
     log::info!(target: "py-runtime", "python runtime is running");
 
     loop {
@@ -166,25 +223,24 @@ impl Supervisor {
       self.bridge.fail_all(codes::RUNTIME_UNAVAILABLE, "python runtime stopped");
       self.status.send_replace(Status::Stopped);
       log::info!(target: "py-runtime", "python runtime stopped (code {code:?})");
-      return;
+      return Exit::Stopped;
     }
+    Exit::Crashed { code, uptime: running_since.elapsed() }
+  }
 
-    log::error!(target: "py-runtime", "python runtime exited unexpectedly (code {code:?})");
-    self.bridge.fail_all(codes::RUNTIME_EXITED, "python runtime exited");
-    self.status.send_replace(Status::Crashed);
-    self.sink.exited(code);
-
-    if self.config.restart_on_crash {
-      tokio::time::sleep(RESTART_DELAY).await;
-      if !self.stopping.load(Ordering::SeqCst) {
-        self.start();
-      }
-    }
+  async fn stop_child(&self, mut child: tokio::process::Child) -> Exit {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    self.bridge.fail_all(codes::RUNTIME_UNAVAILABLE, "python runtime stopped");
+    self.status.send_replace(Status::Stopped);
+    log::info!(target: "py-runtime", "python runtime stopped during startup");
+    Exit::Stopped
   }
 
   fn fail(&self, code: &str, message: &str) {
     log::error!(target: "py-runtime", "{message}");
     *self.writer.lock().unwrap() = None;
+    *self.last_error.lock().unwrap() = Some(Error::new(code, message));
     self.bridge.fail_all(code, message);
     self.status.send_replace(Status::Failed);
   }
@@ -194,24 +250,27 @@ impl Supervisor {
     let ready = async {
       loop {
         let status = *rx.borrow_and_update();
-        match status {
-          Status::Running => return true,
-          Status::Starting => {
-            if rx.changed().await.is_err() {
-              return false;
-            }
+        if status == Status::Running {
+          if let Some(writer) = self.writer.lock().unwrap().clone() {
+            return Some(writer);
           }
-          _ => return false,
+        } else if status != Status::Starting {
+          return None;
+        }
+        if rx.changed().await.is_err() {
+          return None;
         }
       }
     };
-    let running = tokio::time::timeout(self.config.handshake_timeout, ready).await.unwrap_or(false);
-    let writer = if running { self.writer.lock().unwrap().clone() } else { None };
+    let writer = tokio::time::timeout(self.config.handshake_timeout, ready).await.ok().flatten();
     writer.ok_or_else(|| {
-      Error::new(
-        codes::RUNTIME_UNAVAILABLE,
-        format!("python runtime is {}", self.status().as_str()),
-      )
+      let status = self.status();
+      if status == Status::Failed {
+        if let Some(error) = self.last_error.lock().unwrap().clone() {
+          return error;
+        }
+      }
+      Error::new(codes::RUNTIME_UNAVAILABLE, format!("python runtime is {}", status.as_str()))
     })
   }
 
@@ -247,13 +306,26 @@ impl Supervisor {
 
   pub async fn shutdown(&self) {
     self.stopping.store(true, Ordering::SeqCst);
+    let budget = self.config.shutdown_timeout + SHUTDOWN_GRACE;
     let writer = self.writer.lock().unwrap().take();
-    let Some(writer) = writer else { return };
+    let Some(writer) = writer else {
+      match self.status() {
+        Status::Starting => {
+          self.kill.notify_one();
+          self.wait_stopped(budget).await;
+        }
+        Status::Running => {
+          self.wait_stopped(budget).await;
+        }
+        _ => {}
+      }
+      return;
+    };
     let timeout_ms = self.config.shutdown_timeout.as_millis() as u64;
     let _ = writer.send(Frame::new(FrameKind::Shutdown, json!({ "timeoutMs": timeout_ms })));
     drop(writer);
 
-    if !self.wait_stopped(self.config.shutdown_timeout).await {
+    if !self.wait_stopped(budget).await {
       log::warn!(target: "py-runtime", "python runtime did not exit in time, killing it");
       self.kill.notify_one();
       self.wait_stopped(Duration::from_secs(1)).await;
@@ -275,3 +347,4 @@ impl Supervisor {
     tokio::time::timeout(timeout, stopped).await.is_ok()
   }
 }
+

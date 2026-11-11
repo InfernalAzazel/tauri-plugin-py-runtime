@@ -46,10 +46,16 @@ pub fn spawn(config: &ProcessConfig) -> std::io::Result<Spawned> {
 
 pub fn spawn_stderr_logger(stderr: ChildStderr) {
   tauri::async_runtime::spawn(async move {
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-      let (level, message) = parse_level(&line);
+    let mut reader = BufReader::new(stderr);
+    let mut buf = Vec::new();
+    while let Ok(n) = reader.read_until(b'\n', &mut buf).await {
+      if n == 0 {
+        break;
+      }
+      let line = String::from_utf8_lossy(&buf);
+      let (level, message) = parse_level(line.trim_end_matches(['\r', '\n']));
       log::log!(target: "py-runtime", level, "{message}");
+      buf.clear();
     }
   });
 }

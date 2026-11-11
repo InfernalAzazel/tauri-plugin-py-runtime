@@ -82,7 +82,9 @@ pub struct Config {
   pub python: Option<String>,
   /// Python 入口脚本；相对路径的解析规则见 [`Builder::script`]。
   pub script: Option<PathBuf>,
-  /// 追加在脚本路径之后的命令行参数。
+  /// Nuitka 打包产物名，见 [`Builder::bundle`]。
+  pub bundle: Option<String>,
+  /// 追加在脚本路径（或打包产物）之后的命令行参数。
   pub args: Option<Vec<String>>,
   /// 每次调用的默认超时（毫秒），见 [`Builder::invoke_timeout`]。
   pub invoke_timeout_ms: Option<u64>,
@@ -195,6 +197,29 @@ fn resolve_script(
   Err(format!("py-runtime: Python entry script '{}' not found (tried: {tried})", script.display()))
 }
 
+/// 打包产物中可执行文件的文件名：Windows 追加 `.exe`。
+fn bundle_executable(name: &str) -> String {
+  if cfg!(windows) {
+    format!("{name}.exe")
+  } else {
+    name.to_string()
+  }
+}
+
+/// 在资源目录中查找打包产物 `<name>/<name>[.exe]`；找不到时返回包含尝试路径的错误信息。
+fn resolve_bundle(name: &str, resource_dir: Option<&Path>) -> std::result::Result<PathBuf, String> {
+  let dir = resource_dir.ok_or("py-runtime: resource directory unavailable, cannot locate the packaged Python backend")?;
+  let path = dir.join(name).join(bundle_executable(name));
+  if path.is_file() {
+    Ok(path)
+  } else {
+    Err(format!(
+      "py-runtime: packaged Python backend not found at {}; run `tauri-runtime build` and add it to bundle.resources",
+      path.display()
+    ))
+  }
+}
+
 /// 解析配置所需的宿主环境信息，独立出来以便在不启动 Tauri 应用的情况下测试。
 struct Environment<'a> {
   cwd: Option<&'a Path>,
@@ -235,6 +260,7 @@ fn default_python() -> &'static str {
 pub struct Builder {
   python: Option<String>,
   script: Option<PathBuf>,
+  bundle: Option<String>,
   args: Option<Vec<String>>,
   envs: Vec<(String, String)>,
   invoke_timeout: Option<Duration>,
@@ -269,7 +295,17 @@ impl Builder {
     self
   }
 
-  /// 设置追加在脚本路径之后的命令行参数，覆盖配置文件中的 `args`。
+  /// 设置 Nuitka 打包产物名（即 `tauri-runtime build` 配置中的 `name`）。
+  ///
+  /// 仅在 release 构建中生效：运行资源目录下的 `<name>/<name>`（Windows 为 `<name>.exe`），
+  /// 以其所在目录为工作目录，并忽略 [`Builder::python`] 与 [`Builder::script`]；debug 构建
+  /// 仍以解释器运行脚本。产物需通过 `bundle.resources` 打进应用，找不到时 setup 失败。
+  pub fn bundle(mut self, name: impl Into<String>) -> Self {
+    self.bundle = Some(name.into());
+    self
+  }
+
+  /// 设置追加在脚本路径（或打包产物）之后的命令行参数，覆盖配置文件中的 `args`。
   pub fn args<I, S>(mut self, args: I) -> Self
   where
     I: IntoIterator<Item = S>,
@@ -333,20 +369,28 @@ impl Builder {
   fn into_config(self, file: Option<&Config>, env: &Environment) -> std::result::Result<SupervisorConfig, String> {
     let empty = Config::default();
     let file = file.unwrap_or(&empty);
-    let script = self
-      .script
-      .or_else(|| file.script.clone())
-      .ok_or("py-runtime: no Python entry script configured; call Builder::script or set plugins.py-runtime.script")?;
-    let script = resolve_script(&script, env.cwd, env.resource_dir, env.dev)?;
-    let mut args = vec![script.to_string_lossy().into_owned()];
-    args.extend(self.args.or_else(|| file.args.clone()).unwrap_or_default());
+    let extra = self.args.or_else(|| file.args.clone()).unwrap_or_default();
+    let (program, args, cwd) = match self.bundle.or_else(|| file.bundle.clone()) {
+      // release 构建运行打包产物；debug 构建即使配置了 bundle 也运行脚本，改动即时生效。
+      Some(name) if !env.dev => {
+        let exe = resolve_bundle(&name, env.resource_dir)?;
+        let cwd = exe.parent().map(Path::to_path_buf);
+        (exe, extra, cwd)
+      }
+      _ => {
+        let script = self
+          .script
+          .or_else(|| file.script.clone())
+          .ok_or("py-runtime: no Python entry script configured; call Builder::script or set plugins.py-runtime.script")?;
+        let script = resolve_script(&script, env.cwd, env.resource_dir, env.dev)?;
+        let mut args = vec![script.to_string_lossy().into_owned()];
+        args.extend(extra);
+        let python = self.python.or_else(|| file.python.clone()).unwrap_or_else(|| default_python().into());
+        (PathBuf::from(python), args, script.parent().map(Path::to_path_buf))
+      }
+    };
     Ok(SupervisorConfig {
-      process: ProcessConfig {
-        program: self.python.or_else(|| file.python.clone()).unwrap_or_else(|| default_python().into()).into(),
-        args,
-        envs: self.envs,
-        cwd: script.parent().map(Path::to_path_buf),
-      },
+      process: ProcessConfig { program, args, envs: self.envs, cwd },
       handshake_timeout: self.handshake_timeout.unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT),
       invoke_timeout: self
         .invoke_timeout
@@ -526,6 +570,7 @@ mod tests {
     let file = Config {
       python: Some("file-python".into()),
       script: Some("file.py".into()),
+      bundle: None,
       args: Some(vec!["file-arg".into()]),
       invoke_timeout_ms: Some(1000),
       shutdown_timeout_ms: Some(2000),
@@ -567,5 +612,61 @@ mod tests {
   fn missing_script_is_a_config_error() {
     let err = Builder::new().into_config(None, &env(None, None, true)).unwrap_err();
     assert!(err.contains("no Python entry script"), "{err}");
+  }
+
+  fn exe(name: &str) -> String {
+    if cfg!(windows) {
+      format!("{name}.exe")
+    } else {
+      name.to_string()
+    }
+  }
+
+  #[test]
+  fn release_with_bundle_runs_packaged_executable() {
+    let tmp = TempDir::new();
+    let resources = tmp.0.join("resources");
+    let expected = tmp.touch(&format!("resources/py-backend/{}", exe("py-backend")));
+    let config = Builder::new()
+      .bundle("py-backend")
+      .args(["--flag"])
+      .into_config(None, &env(None, Some(&resources), false))
+      .unwrap();
+    assert_eq!(config.process.program, expected);
+    assert_eq!(config.process.args, vec!["--flag".to_string()]);
+    assert_eq!(config.process.cwd.as_deref(), expected.parent());
+  }
+
+  #[test]
+  fn dev_with_bundle_still_runs_script() {
+    let tmp = TempDir::new();
+    let script = tmp.touch("main.py");
+    let config = Builder::new()
+      .bundle("py-backend")
+      .script(&script)
+      .into_config(None, &env(None, None, true))
+      .unwrap();
+    assert_eq!(config.process.args, vec![script.to_string_lossy().into_owned()]);
+  }
+
+  #[test]
+  fn missing_bundle_lists_tried_path() {
+    let tmp = TempDir::new();
+    let resources = tmp.0.join("resources");
+    let err = Builder::new()
+      .bundle("py-backend")
+      .into_config(None, &env(None, Some(&resources), false))
+      .unwrap_err();
+    assert!(err.contains(&resources.join("py-backend").join(exe("py-backend")).display().to_string()), "{err}");
+  }
+
+  #[test]
+  fn bundle_from_file_config() {
+    let tmp = TempDir::new();
+    let resources = tmp.0.join("resources");
+    let expected = tmp.touch(&format!("resources/app/{}", exe("app")));
+    let file: Config = serde_json::from_value(serde_json::json!({ "bundle": "app" })).unwrap();
+    let config = Builder::new().into_config(Some(&file), &env(None, Some(&resources), false)).unwrap();
+    assert_eq!(config.process.program, expected);
   }
 }

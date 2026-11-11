@@ -11,8 +11,11 @@ pub fn run() {
     .plugin(tauri_plugin_log::Builder::new().level(log::LevelFilter::Info).build())
     .plugin(
       tauri_plugin_py_runtime::Builder::new()
+        // debug 构建用 venv 解释器运行脚本；release 构建运行 `tauri-runtime build` 打出的
+        // Nuitka 产物（经 bundle.resources 打包到资源目录的 py-backend/）。
         .python(PYTHON)
         .script("../src-python/main.py")
+        .bundle("py-backend")
         .env("TAURI_RUNTIME_DEBUG", "1")
         .build(),
     )

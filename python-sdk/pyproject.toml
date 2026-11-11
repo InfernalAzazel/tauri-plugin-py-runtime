@@ -7,7 +7,10 @@ name = "tauri-runtime"
 version = "0.1.0"
 description = "Python SDK for tauri-plugin-py-runtime"
 requires-python = ">=3.10"
-dependencies = ["pydantic>=2.9"]
+dependencies = ["pydantic>=2.9", "tomli>=2; python_version < '3.11'"]
+
+[project.scripts]
+tauri-runtime = "tauri_runtime.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8"]

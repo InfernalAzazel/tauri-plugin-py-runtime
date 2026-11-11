@@ -120,9 +120,10 @@ tauri::Builder::default()
 
 | Method | Default | Notes |
 | --- | --- | --- |
-| `script(path)` | – (required) | Python entry script, see [Script path resolution](#script-path-resolution) |
+| `script(path)` | – (required unless a bundle is used) | Python entry script, see [Script path resolution](#script-path-resolution) |
 | `python(program)` | `python3` (`python` on Windows) | Interpreter to run |
-| `args(iter)` | none | Extra arguments passed after the script path |
+| `bundle(name)` | none | Release builds run the Nuitka-packaged backend instead, see [Packaging with Nuitka](#packaging-with-nuitka) |
+| `args(iter)` | none | Extra arguments passed after the script path (or to the packaged executable) |
 | `env(key, value)` | none | Extra environment variable for the Python process; call repeatedly |
 | `invoke_timeout(Duration)` | 30 s | Default timeout per call; a per-call `timeoutMs` is capped at 10× this value |
 | `shutdown_timeout(Duration)` | 3 s | Time Python gets to run shutdown hooks |
@@ -143,6 +144,7 @@ startup instead of being ignored:
     "py-runtime": {
       "python": "python3",
       "script": "../src-python/main.py",
+      "bundle": "py-backend",
       "args": ["--verbose"],
       "invokeTimeoutMs": 30000,
       "shutdownTimeoutMs": 3000,
@@ -178,13 +180,75 @@ Add `"py-runtime:default"` to your capability. It allows `invoke`, `cancel`, `em
 - If nothing is found, plugin setup fails with an error listing every path that was tried.
 - Python runs with the script's directory as its working directory.
 
-> This phase does not package a Python interpreter or your dependencies: the interpreter you
-> configure must have `tauri-runtime` (and therefore `pydantic`) importable. The example app has
-> its own uv project in `src-python` (next to `src-tauri`) whose venv installs the in-repo SDK in
-> editable mode, and runs it via an absolute, compile-time path
-> (`concat!(env!("CARGO_MANIFEST_DIR"), "/../src-python/.venv/bin/python")`), which only works on
-> the machine that built it. Bundling Python and dependencies (uv / Nuitka) is planned
-> for phase 5.
+> In script mode the interpreter you configure must have `tauri-runtime` (and therefore
+> `pydantic`) importable. The example app has its own uv project in `src-python` (next to
+> `src-tauri`) whose venv installs the in-repo SDK in editable mode, and runs it in debug builds
+> via an absolute, compile-time path
+> (`concat!(env!("CARGO_MANIFEST_DIR"), "/../src-python/.venv/bin/python")`). Release builds
+> run the Nuitka-packaged backend instead, so end users don't need Python installed.
+
+### Packaging with Nuitka
+
+`tauri-runtime build` compiles the Python backend with [Nuitka](https://nuitka.net) in
+standalone mode: a folder with an executable, the Python runtime and all dependencies, so the
+user's machine needs no Python. Debug builds keep running the script; release builds with
+`bundle` set run the packaged executable.
+
+1. Add Nuitka to your Python project (a C compiler is required: Xcode Command Line Tools on
+   macOS, MSVC or MinGW on Windows, gcc on Linux):
+
+   ```bash
+   cd src-python && uv add --dev nuitka
+   ```
+
+2. Optionally configure the build in `src-python/pyproject.toml` (defaults shown):
+
+   ```toml
+   [tool.tauri-runtime.build]
+   entry = "main.py"      # entry script
+   name = "py-backend"    # executable and folder name
+   output = "dist"        # output directory
+   nuitka-args = []       # extra Nuitka arguments, e.g. ["--include-data-dir=assets=assets"]
+   ```
+
+   `uv run tauri-runtime build` produces `dist/py-backend/py-backend` (`py-backend.exe` on
+   Windows). Arguments after `--` are passed to Nuitka as well. The build happens in a temporary
+   directory and only replaces the previous output on success.
+
+3. Build it before the app and ship it as a resource in `tauri.conf.json` (`beforeBuildCommand`
+   runs in the directory containing `src-tauri`):
+
+   ```json
+   {
+     "build": {
+       "beforeBuildCommand": "pnpm build && cd src-python && uv run tauri-runtime build"
+     },
+     "bundle": {
+       "resources": { "../src-python/dist/py-backend/": "py-backend/" }
+     }
+   }
+   ```
+
+4. Tell the plugin the bundle name:
+
+   ```rust
+   tauri_plugin_py_runtime::Builder::new()
+       .script("../src-python/main.py") // debug builds
+       .bundle("py-backend")            // release builds: <resources>/py-backend/py-backend
+       .build()
+   ```
+
+Notes:
+
+- The debug/release switch follows `debug_assertions`, so `tauri build --debug` still runs the
+  script.
+- In release builds `python` and `script` are ignored when `bundle` is set; if the executable
+  isn't found, plugin setup fails with the path it looked for.
+- Nuitka follows imports; modules imported dynamically and data files need extra
+  `nuitka-args` (`--include-module`, `--include-package-data`, `--include-data-dir`, ...).
+- The first build takes a few minutes; Nuitka caches compiled C files (ccache) for later builds.
+- Verified on macOS (arm64). Windows and Linux use the same layout (`.exe` suffix on Windows) but
+  haven't been tested yet. Code signing and notarization of the packaged folder are not handled.
 
 ## Frontend
 
@@ -337,8 +401,9 @@ standalone uv project with its own venv that depends on the in-repo SDK (`../../
 editable).
 
 ```bash
-cd examples/vue/src-python && uv sync   # create the example's venv
+cd examples/vue/src-python && uv sync   # create the example's venv (includes Nuitka)
 cd .. && pnpm install && pnpm tauri dev
+pnpm tauri build                         # release build with the Nuitka-packaged backend
 ```
 
 ## Development
@@ -357,4 +422,5 @@ pnpm install && pnpm build              # build guest-js
 2. Desktop native APIs.
 3. System extensions.
 4. Hardware access.
-5. Build toolchain: packaging Python and dependencies with uv / Nuitka.
+5. Build toolchain: packaging Python and dependencies with uv / Nuitka (standalone packaging via
+   `tauri-runtime build` is available; signing and cross-platform verification are pending).

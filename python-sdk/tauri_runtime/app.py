@@ -7,7 +7,6 @@ import logging
 import math
 import os
 import sys
-import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, BinaryIO, Callable, NoReturn
@@ -152,7 +151,8 @@ class App:
         self._writer = Writer(writer)
         self._executor = ThreadPoolExecutor(self._max_workers, thread_name_prefix="tauri-runtime")
         self._protocol_error = False
-        queue: asyncio.Queue[Frame | None] = asyncio.Queue()
+        # Separate from the handler pool so busy handlers cannot starve reading.
+        reader_pool = ThreadPoolExecutor(1, thread_name_prefix="tauri-runtime-reader")
         budget = DEFAULT_SHUTDOWN_TIMEOUT_S
         try:
             try:
@@ -163,8 +163,7 @@ class App:
             self._writer.write(
                 Frame(Kind.HELLO, {"protocol": PROTOCOL_VERSION, "sdk": SDK_VERSION, "commands": self._router.names()})
             )
-            threading.Thread(target=self._read_loop, args=(reader, queue), name="tauri-runtime-reader", daemon=True).start()
-            while (frame := await queue.get()) is not None:
+            while (frame := await self._next_frame(reader_pool, reader)) is not None:
                 if frame.kind == Kind.SHUTDOWN:
                     budget = shutdown_budget(frame.header)
                     break
@@ -177,39 +176,30 @@ class App:
             await self._run_hooks_logged("shutdown", timeout=max(0.0, deadline - self._loop.time()))
             return 2 if self._protocol_error else 0
         finally:
+            # A read blocked in the pool must never delay exit, so neither pool is joined.
+            reader_pool.shutdown(wait=False, cancel_futures=True)
             self._executor.shutdown(wait=False, cancel_futures=True)
             self._writer = None
 
-    def _read_loop(self, reader: BinaryIO, queue: asyncio.Queue[Frame | None]) -> None:
-        loop = self._loop
-        assert loop is not None
-
-        def put(item: Frame | None) -> None:
+    async def _next_frame(self, pool: ThreadPoolExecutor, reader: BinaryIO) -> Frame | None:
+        """Next decodable frame, or None once the stream has ended or broken."""
+        assert self._loop is not None
+        while True:
             try:
-                loop.call_soon_threadsafe(queue.put_nowait, item)
-            except RuntimeError:
-                pass  # loop already closed
-
-        try:
-            while True:
-                try:
-                    frame = read_frame(reader)
-                except MalformedFrame as e:
-                    print(f"[WARN] dropped frame: {e}", file=sys.stderr)
-                    continue
-                if frame is None:
-                    break
-                put(frame)
-        except ProtocolError as e:
-            self._protocol_error = True
-            print(f"[WARN] protocol error: {e}", file=sys.stderr)
-        except OSError as e:
-            self._protocol_error = True
-            print(f"[WARN] read error: {e}", file=sys.stderr)
-        except Exception:
-            traceback.print_exc()
-        finally:
-            put(None)
+                return await self._loop.run_in_executor(pool, read_frame, reader)
+            except MalformedFrame as e:
+                print(f"[WARN] dropped frame: {e}", file=sys.stderr)
+            except ProtocolError as e:
+                self._protocol_error = True
+                print(f"[WARN] protocol error: {e}", file=sys.stderr)
+                return None
+            except OSError as e:
+                self._protocol_error = True
+                print(f"[WARN] read error: {e}", file=sys.stderr)
+                return None
+            except Exception:
+                traceback.print_exc()
+                return None
 
     def _dispatch(self, frame: Frame) -> None:
         if frame.kind == Kind.READY:

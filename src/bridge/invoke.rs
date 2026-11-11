@@ -115,7 +115,7 @@ impl Bridge {
 
     let timeout = opts
       .timeout
-      .map_or(default_timeout, |t| t.min(default_timeout * MAX_TIMEOUT_FACTOR));
+      .map_or(default_timeout, |t| t.min(default_timeout.saturating_mul(MAX_TIMEOUT_FACTOR)));
     match tokio::time::timeout(timeout, rx).await {
       Ok(Ok(result)) => result,
       Ok(Err(_)) => Err(Error::new(codes::RUNTIME_EXITED, "python runtime exited")),

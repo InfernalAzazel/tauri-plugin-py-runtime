@@ -45,12 +45,29 @@ function toPyRuntimeError(error: unknown): PyRuntimeError {
   return new PyRuntimeError("internal", String(error));
 }
 
+// Call ids share one table across all webviews on the Rust side, so they must be globally unique.
+function newCallId(): string {
+  const cryptoApi = globalThis.crypto as Crypto | undefined;
+  if (typeof cryptoApi?.randomUUID === "function") return cryptoApi.randomUUID();
+  const random = Math.random().toString(36).slice(2, 10);
+  return `${Date.now().toString(36)}-${(callCounter++).toString(36)}-${random}`;
+}
+
+/**
+ * Calls a Python command registered with the runtime.
+ *
+ * `Channel` values are only detected at the top level of `args`; channels nested inside
+ * objects or arrays are serialized as plain values and won't be wired up on the Python side.
+ */
 export async function pyInvoke<T = unknown>(
   cmd: string,
   args: PyArgs = {},
   options: PyInvokeOptions = {},
 ): Promise<T> {
-  const callId = `${Date.now().toString(36)}-${(callCounter++).toString(36)}`;
+  if (typeof cmd !== "string" || !/^[\x20-\x7e]+$/.test(cmd)) {
+    throw new PyRuntimeError("invalid_args", "cmd must be a non-empty printable ASCII string");
+  }
+  const callId = newCallId();
   const headers: Record<string, string> = { "x-py-cmd": cmd, "x-py-call-id": callId };
   if (options.timeoutMs !== undefined) headers["x-py-timeout-ms"] = String(options.timeoutMs);
 
@@ -68,17 +85,31 @@ export async function pyInvoke<T = unknown>(
 
   const { signal } = options;
   if (signal?.aborted) throw new PyRuntimeError("cancelled", "call was cancelled");
-  const onAbort = () => {
-    void invoke("plugin:py-runtime|cancel", { id: callId });
-  };
-  signal?.addEventListener("abort", onAbort, { once: true });
+
+  const call = invoke<unknown>("plugin:py-runtime|invoke", body, { headers });
+  let onAbort: (() => void) | undefined;
   try {
-    const result = await invoke<unknown>("plugin:py-runtime|invoke", body, { headers });
+    let result: unknown;
+    if (signal) {
+      // The cancel IPC can overtake the invoke IPC (or arrive while Rust is still waiting for the
+      // runtime), so the abort must settle the promise on the JS side regardless of the backend.
+      call.catch(() => {});
+      const aborted = new Promise<never>((_, reject) => {
+        onAbort = () => {
+          invoke("plugin:py-runtime|cancel", { id: callId }).catch(() => {});
+          reject(new PyRuntimeError("cancelled", "call was cancelled"));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+      result = await Promise.race([call, aborted]);
+    } else {
+      result = await call;
+    }
     return (result instanceof ArrayBuffer ? new Uint8Array(result) : result) as T;
   } catch (error) {
     throw toPyRuntimeError(error);
   } finally {
-    signal?.removeEventListener("abort", onAbort);
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -94,6 +125,10 @@ export function pyListen<T = unknown>(event: string, handler: (event: Event<T>) 
   return listen<T>(`py://${event}`, handler);
 }
 
-export function pyStatus(): Promise<PyStatus> {
-  return invoke<PyStatus>("plugin:py-runtime|status");
+export async function pyStatus(): Promise<PyStatus> {
+  try {
+    return await invoke<PyStatus>("plugin:py-runtime|status");
+  } catch (error) {
+    throw toPyRuntimeError(error);
+  }
 }

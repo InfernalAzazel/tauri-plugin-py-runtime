@@ -2,7 +2,7 @@
 name = "vue-example-backend"
 version = "0.1.0"
 description = "Python backend of the tauri-plugin-py-runtime Vue example"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = ["tauri-runtime"]
 
 [dependency-groups]

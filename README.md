@@ -6,12 +6,53 @@ calls, events and streams between the frontend and Python.
 | Part | Package |
 | --- | --- |
 | Rust plugin | `tauri-plugin-py-runtime` (plugin name `py-runtime`) |
-| Python SDK | `tauri-runtime` on PyPI, imported as `tauri_runtime` (Python ≥ 3.10, requires `pydantic>=2.9`) |
+| Python SDK | `tauri-runtime` on PyPI, imported as `tauri_runtime` (Python ≥ 3.11, requires `pydantic>=2.9`) |
 | Frontend API | `tauri-plugin-py-runtime-api` |
 
 The Rust side and Python talk over the child process's stdin/stdout using a small
 length-prefixed protocol of JSON messages (protocol version 2, frames up to 64 MiB, see
 [Protocol](#protocol)).
+
+## Getting started
+
+The `tauri-runtime` CLI sets everything up. It needs [uv](https://docs.astral.sh/uv/), Cargo
+and Node.js. Create a new app:
+
+```bash
+uvx --from tauri-runtime tauri-runtime create my-app --template vue-ts --manager pnpm
+```
+
+Or add a Python backend to an existing Tauri project (run in the directory containing `src-tauri`):
+
+```bash
+uvx --from tauri-runtime tauri-runtime init
+```
+
+`create` runs `create-tauri-app` and then `init`. `init`:
+
+- creates `src-python/` (`pyproject.toml` depending on `tauri-runtime` with Nuitka as a dev
+  dependency, a `main.py` with a `greet` command, `.gitignore`) and runs `uv sync`;
+- adds the Rust crate (`cargo add`) and the frontend package (pnpm / yarn / bun / npm, detected
+  from the lockfile or `beforeDevCommand`);
+- registers the plugin after `tauri::Builder::default()` in `src-tauri/src/lib.rs`, adds
+  `py-runtime:default` to `capabilities/default.json`, and wires up
+  [Packaging with Nuitka](#packaging-with-nuitka) in `tauri.conf.json` and `build.rs`.
+
+Steps it can't apply safely (an unusual `lib.rs`, `Tauri.toml`, list-form `bundle.resources`, ...)
+are printed for you to do by hand. Re-running is safe: files already set up are left alone, and
+`--force` continues when `src-python` exists without overwriting its files.
+
+Pass `--git` to install all three packages from GitHub, or `--path <checkout>` to use a local
+clone of this repository (build its frontend package first with `pnpm install && pnpm build`).
+
+Then `pnpm tauri dev` runs `src-python/main.py` with `src-python/.venv`, and
+`pnpm tauri build` ships the Nuitka-packaged backend:
+
+```ts
+import { pyInvoke } from "tauri-plugin-py-runtime-api";
+
+const message = await pyInvoke<string>("greet", { name: "Tauri" });
+```
 
 ## Python
 
@@ -121,7 +162,7 @@ tauri::Builder::default()
 | Method | Default | Notes |
 | --- | --- | --- |
 | `script(path)` | – (required unless a bundle is used) | Python entry script, see [Script path resolution](#script-path-resolution) |
-| `python(program)` | `python3` (`python` on Windows) | Interpreter to run |
+| `python(program)` | `<script dir>/.venv` if present, else `python3` (`python` on Windows) | Interpreter to run |
 | `bundle(name)` | none | Release builds run the Nuitka-packaged backend instead, see [Packaging with Nuitka](#packaging-with-nuitka) |
 | `args(iter)` | none | Extra arguments passed after the script path (or to the packaged executable) |
 | `env(key, value)` | none | Extra environment variable for the Python process; call repeatedly |
@@ -180,12 +221,11 @@ Add `"py-runtime:default"` to your capability. It allows `invoke`, `cancel`, `em
 - If nothing is found, plugin setup fails with an error listing every path that was tried.
 - Python runs with the script's directory as its working directory.
 
-> In script mode the interpreter you configure must have `tauri-runtime` (and therefore
-> `pydantic`) importable. The example app has its own uv project in `src-python` (next to
-> `src-tauri`) whose venv installs the in-repo SDK in editable mode, and runs it in debug builds
-> via an absolute, compile-time path
-> (`concat!(env!("CARGO_MANIFEST_DIR"), "/../src-python/.venv/bin/python")`). Release builds
-> run the Nuitka-packaged backend instead, so end users don't need Python installed.
+> In script mode the interpreter must have `tauri-runtime` (and therefore `pydantic`)
+> importable. Without an explicit `python`, the plugin uses the virtual environment next to the
+> script (`.venv/bin/python`, `.venv\Scripts\python.exe` on Windows), so a `uv sync` in
+> `src-python` is all that's needed for `tauri dev`. Release builds run the Nuitka-packaged
+> backend instead, so end users don't need Python installed.
 
 ### Packaging with Nuitka
 
@@ -226,6 +266,16 @@ user's machine needs no Python. Debug builds keep running the script; release bu
      "bundle": {
        "resources": { "../src-python/dist/py-backend/": "py-backend/" }
      }
+   }
+   ```
+
+   tauri-build checks that resource paths exist even for `tauri dev`, so create the folder in
+   `src-tauri/build.rs` before it is first built:
+
+   ```rust
+   fn main() {
+       std::fs::create_dir_all("../src-python/dist/py-backend").expect("failed to create the Python bundle directory");
+       tauri_build::build()
    }
    ```
 

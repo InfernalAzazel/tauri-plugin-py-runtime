@@ -1,4 +1,4 @@
-"""`tauri-runtime` 命令行：`build` 子命令用 Nuitka 将 Python 后端打包为 standalone 目录。
+"""`tauri-runtime build`：用 Nuitka 将 Python 后端打包为 standalone 目录。
 
 配置读取项目 `pyproject.toml` 的 `[tool.tauri-runtime.build]`，产物布局固定为
 `<output>/<name>/<name>`（Windows 为 `<name>.exe`），与 Rust 插件的 `Builder::bundle(name)` 对应。
@@ -6,22 +6,17 @@
 
 from __future__ import annotations
 
-import argparse
 import importlib.util
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-if sys.version_info >= (3, 11):
-    import tomllib
-else:
-    import tomli as tomllib
 
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 KEYS = frozenset({"entry", "name", "output", "nuitka-args"})
@@ -130,24 +125,3 @@ def build(
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(build_dir / f"{Path(config.entry).stem}.dist"), str(target))
     return target / executable_name(config.name)
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    """命令行入口：`tauri-runtime build [--project DIR] [-- NUITKA_ARGS...]`。"""
-    args = list(sys.argv[1:] if argv is None else argv)
-    extra: list[str] = []
-    if "--" in args:
-        index = args.index("--")
-        args, extra = args[:index], args[index + 1 :]
-    parser = argparse.ArgumentParser(prog="tauri-runtime")
-    commands = parser.add_subparsers(dest="command", required=True)
-    build_parser = commands.add_parser("build", help="package the Python backend with Nuitka (standalone)")
-    build_parser.add_argument("--project", type=Path, default=Path.cwd(), help="Python project directory")
-    options = parser.parse_args(args)
-    try:
-        exe = build(options.project.resolve(), extra)
-    except BuildError as e:
-        print(f"tauri-runtime: {e}", file=sys.stderr)
-        return 1
-    print(f"tauri-runtime: built {exe}")
-    return 0

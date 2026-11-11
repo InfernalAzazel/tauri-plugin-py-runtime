@@ -1,15 +1,15 @@
 import asyncio
 import io
 import json
+from typing import Annotated
 
 import pytest
-
-from tauri_runtime.channel import Channel
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pydantic.alias_generators import to_camel, to_snake
 
-from tauri_runtime.command import Command, TauriError, bind_arguments, build_handler
 from tauri_runtime import protocol as wire
+from tauri_runtime.channel import Channel
+from tauri_runtime.command import Command, TauriError, bind_arguments, build_handler
 from tauri_runtime.protocol import Frame, Raw, Writer, read_frame
 from tauri_runtime.router import CommandTable
 
@@ -102,6 +102,25 @@ def test_defaults_and_pydantic_model_params():
     kwargs = bind(h, {"p": {"x": "1", "y": 2}})
     assert kwargs == {"p": Point(x=1, y=2)}
     assert bind(h, {"p": {"x": 1, "y": 2}, "scale": "3"})["scale"] == 3
+
+
+def test_annotated_constraints_are_enforced():
+    def handler(
+        query: Annotated[str, Field(min_length=1)],
+        on_item: Annotated[Channel[int], "doc"],
+        page_size: Annotated[int, Field(ge=1, le=100)] = 20,
+    ):
+        return query
+
+    h = build_handler("h", handler, FakeApp)
+    channels = {"on_item": Channel(5, Writer(io.BytesIO()))}
+    assert bind(h, {"query": "a", "pageSize": 100}, channels)["page_size"] == 100
+    with pytest.raises(TauriError) as e:
+        bind(h, {"query": "", "pageSize": 0}, channels)
+    assert [(err["loc"], err["type"]) for err in e.value.data] == [
+        (["query"], "string_too_short"),
+        (["pageSize"], "greater_than_equal"),
+    ]
 
 
 def test_missing_channel_is_invalid_args():

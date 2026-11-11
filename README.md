@@ -155,7 +155,7 @@ environment. `pnpm tauri build` compiles the backend and bundles it into the app
 | Frontend | Installs the API package with pnpm, yarn, bun or npm. The package manager is detected from the lockfile or `beforeDevCommand` |
 | Permissions | Adds `py-runtime:default` to `capabilities/default.json` |
 | Packaging | Configures `beforeBuildCommand` and `bundle.resources` in `tauri.conf.json`, and `build.rs`, as described in [Distribution](#distribution) |
-| Editor | Points VS Code / Cursor at `src-python/.venv` in `.vscode/settings.json` and recommends the Python extension in `.vscode/extensions.json`. See [Editor setup](#editor-setup) |
+| Editor | Writes `pyrightconfig.json` so that VS Code, Cursor and other pyright-based editors use `src-python/.venv`. See [Editor setup](#editor-setup) |
 
 `create` also replaces the template's Rust `greet` command with the Python one: the frontend calls
 `pyInvoke("greet", ...)` and the Rust command is removed from `lib.rs`. If the frontend can't be
@@ -183,51 +183,26 @@ The Python backend has its own virtual environment in `src-python/.venv`, which 
 on its own. Until you point the editor at it, imports such as `from tauri_runtime import App`
 show as unresolved and you get no completions.
 
-If `src-python/.venv` doesn't exist, create it first:
-
-```bash
-cd src-python && uv sync
-```
-
-| Platform | Interpreter path |
-| --- | --- |
-| macOS / Linux | `src-python/.venv/bin/python` |
-| Windows | `src-python\.venv\Scripts\python.exe` |
-
-**VS Code / Cursor.** `create` and `init` set this up for you. They add the interpreter to
-`.vscode/settings.json` and recommend the Python extension (`ms-python.python`) in
-`.vscode/extensions.json`:
-
-```json
-{
-  "python.defaultInterpreterPath": "${workspaceFolder}/src-python/.venv/bin/python"
-}
-```
-
-The path is written for the platform you run the CLI on. On Windows it is
-`${workspaceFolder}/src-python/.venv/Scripts/python.exe`. If you already chose an interpreter,
-the CLI leaves it alone. VS Code allows comments in `settings.json`, but the CLI can't safely
-rewrite a file that has them, so in that case it prints the line to add instead. To set the
-interpreter by hand, run **Python: Select Interpreter** from the Command Palette, choose
-**Enter interpreter path…** and enter the path above.
-
-**PyCharm.** Open **Settings → Project → Python Interpreter → Add Interpreter → Add Local
-Interpreter → Select existing**, then enter the path above. Right-click `src-python` and choose
-**Mark Directory as → Sources Root** so that imports between your backend modules resolve.
-
-**Pyright, basedpyright, Zed, Neovim and other LSP editors.** Add a `pyrightconfig.json` to the
-project root:
+`create` and `init` write a `pyrightconfig.json` to the project root, unless one already exists:
 
 ```json
 {
   "venvPath": "src-python",
   "venv": ".venv",
-  "extraPaths": ["src-python"]
+  "executionEnvironments": [{ "root": "src-python" }]
 }
 ```
 
-You can also open `src-python` as its own folder or workspace. Most editors detect a `.venv` in
-the folder root automatically.
+The file works on every platform. It is read by Pylance (the Python language server in
+VS Code and Cursor), pyright and basedpyright, so these editors resolve imports from the virtual
+environment and between your backend modules without extra setup. That includes Zed, Neovim and
+other editors that use pyright. If `src-python/.venv` doesn't exist yet, create it with
+`cd src-python && uv sync`.
+
+**PyCharm** doesn't read `pyrightconfig.json`. Open **Settings → Project → Python Interpreter →
+Add Interpreter → Add Local Interpreter → Select existing** and enter
+`src-python/.venv/bin/python` (`src-python\.venv\Scripts\python.exe` on Windows). Then
+right-click `src-python` and choose **Mark Directory as → Sources Root**.
 
 ## Guide
 
@@ -297,6 +272,124 @@ described instead of a JSON value:
 - If `data` isn't JSON-serializable, the error is sent without `data` and a `[WARN]` is logged.
 - Any other exception becomes `internal` with `data = {"type": "<ExceptionName>"}`. Set
   `TAURI_RUNTIME_DEBUG=1` in the Python environment to also include the traceback.
+
+### Using pydantic models
+
+Use pydantic models for structured arguments and results. Add field constraints with
+`Annotated[..., Field(...)]`.
+
+```python
+from datetime import datetime
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic.alias_generators import to_camel
+
+from tauri_runtime import App
+
+app = App()
+
+
+class Schema(BaseModel):
+    """Base model that uses camelCase keys in JSON, like the frontend."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+
+class UserBase(Schema):
+    full_name: Annotated[str, Field(min_length=1, max_length=50)]
+    email: EmailStr
+    role: Literal["admin", "member"] = "member"
+
+
+class NewUser(UserBase):
+    @field_validator("email")
+    @classmethod
+    def email_not_taken(cls, email: str) -> str:
+        if any(u.email == email for u in users):
+            raise ValueError("email already registered")
+        return email
+
+
+class User(UserBase):
+    id: int
+    created_at: datetime
+
+
+class UserPage(Schema):
+    items: list[User]
+    total_count: int
+
+
+users: list[User] = []
+
+
+@app.command
+async def create_user(user: NewUser) -> User:
+    created = User(**user.model_dump(), id=len(users) + 1, created_at=datetime.now())
+    users.append(created)
+    return created
+
+
+@app.command
+async def list_users(
+    page: Annotated[int, Field(ge=1)] = 1,
+    page_size: Annotated[int, Field(ge=1, le=100)] = 20,
+) -> UserPage:
+    start = (page - 1) * page_size
+    return UserPage(items=users[start : start + page_size], total_count=len(users))
+
+
+app.run()
+```
+
+`EmailStr` requires the `email-validator` package; install it with `uv add "pydantic[email]"`.
+
+```ts
+import { pyInvoke } from "tauri-plugin-py-runtime-api";
+
+interface User {
+  id: number;
+  fullName: string;
+  email: string;
+  role: "admin" | "member";
+  createdAt: string; // ISO 8601
+}
+
+const user = await pyInvoke<User>("create_user", {
+  user: { fullName: "Ada Lovelace", email: "ada@example.com" },
+});
+
+const { items, totalCount } = await pyInvoke<{ items: User[]; totalCount: number }>("list_users", {
+  pageSize: 10,
+});
+```
+
+How the pieces fit:
+
+- **Arguments.** A command's own parameters always accept camelCase keys (`pageSize` →
+  `page_size`). Fields inside a model follow the model's config, so give models
+  `alias_generator=to_camel` (as `Schema` does) to accept `fullName`. `populate_by_name=True`
+  also accepts the snake_case names.
+- **Results.** Models are serialized by alias, so `Schema` subclasses return camelCase keys
+  (`createdAt`, `totalCount`). A `datetime` becomes an ISO 8601 string.
+- **Validation.** Invalid input fails the call with `invalid_args` before your command runs, so
+  the command body only handles valid data. Custom checks go in pydantic validators: raise
+  `ValueError` in a `field_validator`, as `email_not_taken` does, and the error is reported like
+  any other. `data` lists every error with its location and message.
+
+```ts
+try {
+  await pyInvoke("create_user", { user: { fullName: "", email: "ada@example.com" } });
+} catch (e) {
+  // e.code === "invalid_args"
+  // e.data: [{ loc: ["user", "fullName"], type: "string_too_short", msg: "String should have at least 1 character", ... },
+  //          { loc: ["user", "email"], type: "value_error", msg: "Value error, email already registered", ... }]
+}
+```
+
+For an error the frontend should handle with its own code, raise
+`TauriError(code, message)` from the command instead. See [Writing commands](#writing-commands).
 
 ### Events and lifecycle hooks
 

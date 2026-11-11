@@ -32,6 +32,15 @@ dist/
 __pycache__/
 """
 
+# 项目根目录的 pyrightconfig.json：Pylance（VS Code / Cursor）、pyright、basedpyright 均据此找到后端虚拟环境
+PYRIGHT_CONFIG = """\
+{
+  "venvPath": "src-python",
+  "venv": ".venv",
+  "executionEnvironments": [{ "root": "src-python" }]
+}
+"""
+
 FRONTEND_SNIPPET = """\
 import { pyInvoke } from "tauri-plugin-py-runtime-api";
 

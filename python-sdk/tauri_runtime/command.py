@@ -101,7 +101,9 @@ class Handler:
 
 
 def _classify(annotation: Any, app_type: type) -> int:
-    """按注解判定参数类别；`App` 子类同样视为应用实例。"""
+    """按注解判定参数类别；`App` 子类同样视为应用实例，`Annotated[T, ...]` 按 `T` 判定。"""
+    if typing.get_origin(annotation) is typing.Annotated:
+        annotation = annotation.__origin__
     origin = typing.get_origin(annotation) or annotation
     if annotation is Command:
         return _CONTEXT
@@ -130,7 +132,8 @@ def build_handler(name: str, func: Callable[..., Any], app_type: type) -> Handle
     Raises:
         TypeError: 某个 JSON 参数的注解无法由 pydantic 校验，或参数名无法作为模型字段（如以 `_` 开头）。
     """
-    hints = typing.get_type_hints(func)
+    # 保留 `Annotated` 元数据，否则 `Field(ge=1)` 等约束会被丢弃
+    hints = typing.get_type_hints(func, include_extras=True)
     model_name = f"{name}_args"
     params, fields = [], {}
     for p in inspect.signature(func).parameters.values():

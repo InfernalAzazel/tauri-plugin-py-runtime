@@ -1,6 +1,6 @@
 {
   "name": "tauri-plugin-py-runtime-api",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Frontend API for tauri-plugin-py-runtime: call Python backends from Tauri 2 apps",
   "license": "MIT OR Apache-2.0",
   "author": "kylin",

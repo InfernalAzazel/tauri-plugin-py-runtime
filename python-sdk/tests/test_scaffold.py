@@ -291,45 +291,16 @@ def test_init_sets_up_project(tmp_path):
     assert "py-runtime:default" in capability["permissions"]
     conf = json.loads((project / "src-tauri" / "tauri.conf.json").read_text())
     assert scaffold.BUILD_STEP in conf["build"]["beforeBuildCommand"]
-    settings = json.loads((project / ".vscode" / "settings.json").read_text())
-    assert settings == {scaffold.INTERPRETER_SETTING: scaffold.venv_interpreter()}
-    extensions = json.loads((project / ".vscode" / "extensions.json").read_text())
-    assert extensions == {"recommendations": [scaffold.PYTHON_EXTENSION]}
+    pyright = json.loads((project / "pyrightconfig.json").read_text())
+    assert pyright == {"venvPath": "src-python", "venv": ".venv", "executionEnvironments": [{"root": "src-python"}]}
+    assert not (project / ".vscode").exists()
 
 
-def test_venv_interpreter_per_platform():
-    assert scaffold.venv_interpreter(windows=False) == "${workspaceFolder}/src-python/.venv/bin/python"
-    assert scaffold.venv_interpreter(windows=True) == "${workspaceFolder}/src-python/.venv/Scripts/python.exe"
-
-
-def test_patch_vscode_settings_merges_and_respects_user_choice():
-    text = scaffold.patch_vscode_settings('{\n  "svelte.enable-ts-plugin": true\n}\n', "/py")
-    assert text is not None
-    assert json.loads(text) == {"svelte.enable-ts-plugin": True, scaffold.INTERPRETER_SETTING: "/py"}
-    mine = json.dumps({scaffold.INTERPRETER_SETTING: "/usr/bin/python3"})
-    assert scaffold.patch_vscode_settings(mine, "/py") == mine
-    assert scaffold.patch_vscode_settings('{\n  // comment\n  "a": 1\n}\n', "/py") is None
-    assert scaffold.patch_vscode_settings("[]", "/py") is None
-
-
-def test_patch_vscode_extensions_adds_python():
-    template = '{\n  "recommendations": ["Vue.volar", "rust-lang.rust-analyzer"]\n}\n'
-    text = scaffold.patch_vscode_extensions(template)
-    assert text is not None
-    assert json.loads(text)["recommendations"] == ["Vue.volar", "rust-lang.rust-analyzer", scaffold.PYTHON_EXTENSION]
-    assert scaffold.patch_vscode_extensions(text) == text
-    assert scaffold.patch_vscode_extensions('{"recommendations": "x"}') is None
-
-
-def test_setup_vscode_hints_for_unparsable_settings(tmp_path):
-    (tmp_path / ".vscode").mkdir()
-    jsonc = '{\n  // mine\n  "editor.tabSize": 2\n}\n'
-    (tmp_path / ".vscode" / "settings.json").write_text(jsonc)
-    hints = scaffold.setup_vscode(tmp_path)
-    assert len(hints) == 1
-    assert hints[0].startswith(".vscode/settings.json:")
-    assert (tmp_path / ".vscode" / "settings.json").read_text() == jsonc
-    assert (tmp_path / ".vscode" / "extensions.json").is_file()
+def test_init_keeps_existing_pyright_config(tmp_path):
+    project = make_tauri_project(tmp_path)
+    (project / "pyrightconfig.json").write_text("{}\n")
+    scaffold.init(project, run=FakeRun())
+    assert (project / "pyrightconfig.json").read_text() == "{}\n"
 
 
 def test_init_refuses_existing_backend_unless_forced(tmp_path):

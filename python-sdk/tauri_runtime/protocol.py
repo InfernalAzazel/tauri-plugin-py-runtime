@@ -25,7 +25,7 @@ from typing import Annotated, Any, BinaryIO, Literal, NoReturn, Union
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 PROTOCOL_VERSION = 2
-SDK_VERSION = "0.1.1"
+SDK_VERSION = "0.1.2"
 MAX_FRAME_SIZE = 64 * 1024 * 1024
 
 _U32 = struct.Struct(">I")

@@ -5,7 +5,10 @@ import json
 import pytest
 
 from tauri_runtime.channel import Channel
-from tauri_runtime.command import Command, TauriError, bind_arguments, build_handler, to_snake
+from pydantic import BaseModel
+from pydantic.alias_generators import to_camel, to_snake
+
+from tauri_runtime.command import Command, TauriError, bind_arguments, build_handler
 from tauri_runtime import protocol as wire
 from tauri_runtime.protocol import Frame, Raw, Writer, read_frame
 from tauri_runtime.router import Router
@@ -15,12 +18,100 @@ class FakeApp:
     pass
 
 
+def bind(h, args, channels=None):
+    return bind_arguments(h, args, None, channels or {}, Command(1, h.name), FakeApp())
+
+
 @pytest.mark.parametrize(
     "name,expected",
     [("onItem", "on_item"), ("first_name", "first_name"), ("userID", "user_id"), ("HTTPServer", "http_server")],
 )
 def test_to_snake(name, expected):
     assert to_snake(name) == expected
+
+
+def test_acronym_keys():
+    # 参数键按 to_camel(形参名) 匹配：连续大写的 `fileURLPath` 不是别名，视为未知键；通道键经 to_snake 映射可识别。
+    assert to_camel("file_url_path") == "fileUrlPath"
+    assert to_snake("fileURLPath") == "file_url_path"
+
+    def handler(file_url_path: str):
+        return file_url_path
+
+    h = build_handler("h", handler, FakeApp)
+    assert bind(h, {"fileUrlPath": "a"}) == {"file_url_path": "a"}
+    with pytest.raises(TauriError) as e:
+        bind(h, {"fileURLPath": "a"})
+    assert e.value.data[0]["type"] == "missing"
+
+
+def test_camel_and_snake_keys_both_accepted():
+    def handler(first_name: str, last_name: str = "x"):
+        return first_name
+
+    h = build_handler("h", handler, FakeApp)
+    assert bind(h, {"firstName": "a", "last_name": "b"}) == {"first_name": "a", "last_name": "b"}
+    assert bind(h, {"first_name": "a", "extra": 1}) == {"first_name": "a"}
+
+
+def test_unsupported_annotation_fails_at_registration():
+    class Opaque:
+        pass
+
+    def handler(thing: Opaque):
+        return thing
+
+    with pytest.raises(TypeError, match=r"command 'h'.*parameter 'thing'"):
+        build_handler("h", handler, FakeApp)
+
+
+def test_underscore_parameter_fails_at_registration():
+    def handler(_hidden: int):
+        return _hidden
+
+    with pytest.raises(TypeError, match="'_hidden'"):
+        build_handler("h", handler, FakeApp)
+
+
+def test_multiple_invalid_fields_in_one_error():
+    def handler(a: int, b: int, c: str):
+        return a
+
+    h = build_handler("h", handler, FakeApp)
+    with pytest.raises(TauriError) as e:
+        bind(h, {"a": "x", "b": "y"})
+    assert e.value.code == "invalid_args"
+    assert [(err["loc"], err["type"]) for err in e.value.data] == [
+        (["a"], "int_parsing"),
+        (["b"], "int_parsing"),
+        (["c"], "missing"),
+    ]
+    assert e.value.message == "invalid arguments: a, b, c"
+    json.dumps(e.value.data)
+
+
+def test_defaults_and_pydantic_model_params():
+    class Point(BaseModel):
+        x: int
+        y: int
+
+    def handler(p: Point, scale: int = 2, tags: list[str] | None = None):
+        return p
+
+    h = build_handler("h", handler, FakeApp)
+    kwargs = bind(h, {"p": {"x": "1", "y": 2}})
+    assert kwargs == {"p": Point(x=1, y=2)}
+    assert bind(h, {"p": {"x": 1, "y": 2}, "scale": "3"})["scale"] == 3
+
+
+def test_missing_channel_is_invalid_args():
+    def handler(on_item: Channel[int]):
+        return on_item
+
+    h = build_handler("h", handler, FakeApp)
+    with pytest.raises(TauriError) as e:
+        bind(h, {})
+    assert e.value.code == "invalid_args"
 
 
 def test_injects_special_parameters():

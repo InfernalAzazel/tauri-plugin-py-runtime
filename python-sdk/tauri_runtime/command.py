@@ -2,19 +2,20 @@
 
 注册命令时，`build_handler` 根据参数注解将每个参数归类为：调用上下文（`Command`）、
 应用实例（`App`）、二进制载荷（`Raw`）、通道（`Channel[T]`）或普通 JSON 参数；
-调用时由 `bind_arguments` 按类别填充实参，普通参数经 pydantic 校验。
+普通参数汇总为每个处理器一个的 pydantic 模型；调用时由 `bind_arguments` 按类别填充实参，
+普通参数经该模型一次性校验。
 """
 
 from __future__ import annotations
 
 import inspect
 import json
-import re
 import typing
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
-from pydantic import TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, create_model
+from pydantic.alias_generators import to_camel
 
 from .channel import Channel
 from .protocol import Raw
@@ -70,43 +71,32 @@ class Command:
     cancelled: bool = False
 
 
-_ACRONYM = re.compile(r"([A-Z]+)([A-Z][a-z])")
-_WORD = re.compile(r"([a-z0-9])([A-Z])")
-
-
-def to_snake(name: str) -> str:
-    """将 camelCase / PascalCase 转为 snake_case，连续大写视为缩写（`fileURLPath` → `file_url_path`）。
-
-    Args:
-        name: 原始名称；已是 snake_case 的名称保持不变。
-
-    Returns:
-        snake_case 名称。
-    """
-    return _WORD.sub(r"\1_\2", _ACRONYM.sub(r"\1_\2", name)).lower()
-
-
 _CONTEXT, _APP, _RAW, _CHANNEL, _ARG = range(5)
+
+# 键名规则：形参名经 `to_camel` 得到别名（`file_url_path` → `fileUrlPath`），别名与形参名均可作键；
+# 连续大写的键（如 `fileURLPath`）不会被识别。通道键则经 `to_snake` 映射（`fileURLPath` → `file_url_path`）。
+_MODEL_CONFIG = ConfigDict(
+    alias_generator=to_camel, populate_by_name=True, arbitrary_types_allowed=False, protected_namespaces=()
+)
 
 
 @dataclass
 class Param:
-    """处理器的一个形参；`kind` 为 `_CONTEXT` 等类别之一，`adapter` 仅普通 JSON 参数持有。"""
+    """处理器的一个注入型形参；`kind` 为 `_CONTEXT`、`_APP`、`_RAW` 或 `_CHANNEL`。"""
 
     name: str
     kind: int
-    default: Any
-    adapter: Any = None
 
 
 @dataclass
 class Handler:
-    """已注册的命令：命令名、原始函数及预先解析好的形参列表。"""
+    """已注册的命令：命令名、原始函数、注入型形参列表及 JSON 参数的 pydantic 模型。"""
 
     name: str
     func: Callable[..., Any]
     is_async: bool
-    params: list[Param] = field(default_factory=list)
+    params: list[Param]
+    model: type[BaseModel]
 
 
 def _classify(annotation: Any, app_type: type) -> int:
@@ -123,18 +113,10 @@ def _classify(annotation: Any, app_type: type) -> int:
     return _ARG
 
 
-def _adapter(annotation: Any) -> Any:
-    """为注解构建 pydantic `TypeAdapter`；无注解或 pydantic 不支持的类型返回 `None`（不校验）。"""
-    if annotation is inspect.Parameter.empty:
-        return None
-    try:
-        return TypeAdapter(annotation)
-    except Exception:
-        return None
-
-
 def build_handler(name: str, func: Callable[..., Any], app_type: type) -> Handler:
     """解析函数签名，生成可供路由与绑定使用的 `Handler`。
+
+    注入型参数之外的 JSON 参数汇总为一个 pydantic 模型；无注解的参数按 `Any` 处理。
 
     Args:
         name: 对外暴露的命令名。
@@ -143,26 +125,29 @@ def build_handler(name: str, func: Callable[..., Any], app_type: type) -> Handle
 
     Returns:
         解析后的 `Handler`。
+
+    Raises:
+        TypeError: 某个 JSON 参数的注解无法由 pydantic 校验，或参数名无法作为模型字段（如以 `_` 开头）。
     """
     hints = typing.get_type_hints(func)
-    params = []
+    model_name = f"{name}_args"
+    params, fields = [], {}
     for p in inspect.signature(func).parameters.values():
-        annotation = hints.get(p.name, inspect.Parameter.empty)
+        annotation = hints.get(p.name, Any)
         kind = _classify(annotation, app_type)
-        params.append(Param(p.name, kind, p.default, _adapter(annotation) if kind == _ARG else None))
-    return Handler(name, func, inspect.iscoroutinefunction(func), params)
-
-
-def _validate(param: Param, value: Any) -> Any:
-    """用 pydantic 校验并转换参数值；失败时抛出 `invalid_args`，`data` 为校验错误列表。"""
-    if param.adapter is None:
-        return value
-    try:
-        return param.adapter.validate_python(value)
-    except ValidationError as e:
-        raise TauriError(
-            "invalid_args", f"invalid argument '{param.name}'", json.loads(e.json(include_url=False))
-        ) from None
+        if kind != _ARG:
+            params.append(Param(p.name, kind))
+            continue
+        spec = (annotation, ... if p.default is inspect.Parameter.empty else p.default)
+        try:
+            ok = p.name in create_model(model_name, __config__=_MODEL_CONFIG, **{p.name: spec}).model_fields
+        except Exception as e:
+            raise TypeError(f"command '{name}': unsupported annotation for parameter '{p.name}': {e}") from e
+        if not ok:
+            raise TypeError(f"command '{name}': parameter '{p.name}' cannot be a model field")
+        fields[p.name] = spec
+    model = create_model(model_name, __config__=_MODEL_CONFIG, **fields)
+    return Handler(name, func, inspect.iscoroutinefunction(func), params, model)
 
 
 def bind_arguments(
@@ -175,8 +160,8 @@ def bind_arguments(
 ) -> dict[str, Any]:
     """为一次调用构造处理器的关键字实参。
 
-    JSON 参数对象的键先转为 snake_case 再与形参名匹配；未提供且有默认值的形参不出现在结果中，
-    交由 Python 使用默认值。
+    JSON 参数对象经 `handler.model` 一次性校验，camelCase 别名与 snake_case 形参名均可作键，
+    未知键忽略。未提供且有默认值的形参不出现在结果中，交由 Python 使用默认值。
 
     Args:
         handler: 目标处理器。
@@ -190,14 +175,13 @@ def bind_arguments(
         关键字实参字典。
 
     Raises:
-        TauriError: 错误码均为 `invalid_args`：参数不是 JSON 对象、缺少必填参数、缺少通道、
-            期望二进制载荷但未提供，或 pydantic 校验失败。
+        TauriError: 错误码均为 `invalid_args`：参数不是 JSON 对象、缺少通道、期望二进制载荷但未提供，
+            或 pydantic 校验失败（缺少必填参数、类型不符等；全部字段错误汇总于 `data`）。
     """
     if args is None:
         args = {}
     if not isinstance(args, dict):
         raise TauriError("invalid_args", "arguments must be a JSON object")
-    values = {to_snake(k): v for k, v in args.items()}
     kwargs: dict[str, Any] = {}
     for p in handler.params:
         if p.kind == _CONTEXT:
@@ -208,12 +192,14 @@ def bind_arguments(
             if raw is None:
                 raise TauriError("invalid_args", f"parameter '{p.name}' expects raw bytes")
             kwargs[p.name] = raw
-        elif p.kind == _CHANNEL:
-            if p.name not in channels:
-                raise TauriError("invalid_args", f"missing channel '{p.name}'")
+        elif p.name not in channels:
+            raise TauriError("invalid_args", f"missing channel '{p.name}'")
+        else:
             kwargs[p.name] = channels[p.name]
-        elif p.name in values:
-            kwargs[p.name] = _validate(p, values[p.name])
-        elif p.default is inspect.Parameter.empty:
-            raise TauriError("invalid_args", f"missing argument '{p.name}'")
-    return kwargs
+    try:
+        values = handler.model.model_validate(args)
+    except ValidationError as e:
+        errors = json.loads(e.json(include_url=False))
+        fields = ", ".join(".".join(map(str, err["loc"])) for err in errors)
+        raise TauriError("invalid_args", f"invalid arguments: {fields}", errors) from None
+    return kwargs | {f: getattr(values, f) for f in values.model_fields_set}

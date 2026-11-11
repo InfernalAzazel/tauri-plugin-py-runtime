@@ -17,9 +17,11 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, BinaryIO, Callable, NoReturn
 
+from pydantic.alias_generators import to_snake
+
 from . import protocol as wire
 from .channel import Channel
-from .command import Command, TauriError, bind_arguments, build_handler, to_snake
+from .command import Command, TauriError, bind_arguments, build_handler
 from .event import Event, EventBus
 from .protocol import (
     PROTOCOL_VERSION,

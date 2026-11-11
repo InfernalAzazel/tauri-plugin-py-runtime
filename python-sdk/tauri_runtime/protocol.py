@@ -5,28 +5,16 @@ import os
 import struct
 import sys
 import threading
-from dataclasses import asdict, dataclass, field, is_dataclass
-from enum import IntEnum
-from typing import Any, BinaryIO
+from dataclasses import dataclass
+from typing import Annotated, Any, BinaryIO, Literal, NoReturn, Union
 
-PROTOCOL_VERSION = 1
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+
+PROTOCOL_VERSION = 2
 SDK_VERSION = "0.1.0"
 MAX_FRAME_SIZE = 64 * 1024 * 1024
 
 _U32 = struct.Struct(">I")
-
-
-class Kind(IntEnum):
-    HELLO = 0x01
-    READY = 0x02
-    SHUTDOWN = 0x03
-    REQUEST = 0x10
-    RESPONSE = 0x11
-    ERROR = 0x12
-    CANCEL = 0x13
-    EVENT = 0x20
-    CHANNEL_DATA = 0x30
-    CHANNEL_CLOSE = 0x31
 
 
 class ProtocolError(Exception):
@@ -43,13 +31,6 @@ class FrameTooLarge(MalformedFrame):
         self.size = size
 
 
-@dataclass
-class Frame:
-    kind: Kind
-    header: dict[str, Any] = field(default_factory=dict)
-    body: bytes = b""
-
-
 class Raw:
     __slots__ = ("bytes",)
 
@@ -63,47 +44,149 @@ class Raw:
         return f"Raw({len(self.bytes)} bytes)"
 
 
-def _json_default(value: Any) -> Any:
-    if is_dataclass(value) and not isinstance(value, type):
-        return asdict(value)
-    dump = getattr(value, "model_dump", None)
-    if callable(dump):
-        return dump(mode="json")
-    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+# Field order is the wire order and matches the Rust `Message` enum. A JSON payload travels
+# inline as `value`; a binary payload travels in the frame body, flagged with `raw: true`.
 
 
-def _dumps(value: Any) -> bytes:
-    return json.dumps(
-        value, default=_json_default, ensure_ascii=False, allow_nan=False, separators=(",", ":")
-    ).encode()
+class _Message(BaseModel):
+    model_config = ConfigDict(strict=True, populate_by_name=True)
+
+
+class Hello(_Message):
+    type: Literal["hello"] = "hello"
+    protocol: int
+    sdk: str = SDK_VERSION
+    commands: list[str] = []
+
+
+class AppInfo(_Message):
+    name: str
+    version: str
+
+
+class Ready(_Message):
+    type: Literal["ready"] = "ready"
+    protocol: int
+    app: AppInfo
+
+
+class Shutdown(_Message):
+    type: Literal["shutdown"] = "shutdown"
+    timeout_ms: Any = Field(None, alias="timeoutMs")
+
+
+class Request(_Message):
+    type: Literal["request"] = "request"
+    id: int
+    cmd: str
+    channels: dict[str, int] = {}
+    window: str | None = None
+    value: Any = None
+    raw: bool | None = None
+
+
+class Response(_Message):
+    type: Literal["response"] = "response"
+    id: int
+    value: Any = None
+    raw: bool | None = None
+
+
+class Error(_Message):
+    type: Literal["error"] = "error"
+    id: int
+    code: str | None = None
+    message: str | None = None
+    data: Any = None
+
+
+class Cancel(_Message):
+    type: Literal["cancel"] = "cancel"
+    id: int
+    reason: str | None = None
+
+
+class Event(_Message):
+    """Python → Rust events carry `target`, Rust → Python events carry `window`."""
+
+    type: Literal["event"] = "event"
+    event: str
+    target: str | None = None
+    window: str | None = None
+    value: Any = None
+    raw: bool | None = None
+
+
+class ChannelData(_Message):
+    type: Literal["channel_data"] = "channel_data"
+    channel: int
+    value: Any = None
+    raw: bool | None = None
+
+
+class ChannelClose(_Message):
+    type: Literal["channel_close"] = "channel_close"
+    channel: int
+
+
+Message = Annotated[
+    Union[Hello, Ready, Shutdown, Request, Response, Error, Cancel, Event, ChannelData, ChannelClose],
+    Field(discriminator="type"),
+]
+# Writing NaN / ±Infinity as JSON constants (for nested user models too) lets encode() reject them.
+MESSAGE: TypeAdapter[Message] = TypeAdapter(Message, config=ConfigDict(ser_json_inf_nan="constants"))
+
+
+@dataclass
+class Frame:
+    message: Message
+    body: bytes = b""
+
+
+def split_payload(value: Any) -> tuple[dict[str, Any], bytes]:
+    """Message fields and frame body for a payload."""
+    if isinstance(value, Raw):
+        return {"raw": True}, value.bytes
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {"raw": True}, bytes(value)
+    return {"value": value}, b""
+
+
+def join_payload(message: Request | Response | Event | ChannelData, body: bytes) -> Any:
+    if message.raw:
+        if message.value is not None:
+            raise MalformedFrame("raw payload with an inline value")
+        return Raw(body)
+    if body:
+        raise MalformedFrame("frame body without the raw flag")
+    return message.value
+
+
+def _reject_constant(name: str) -> NoReturn:
+    raise ValueError(f"{name} is not valid JSON")
 
 
 def encode(frame: Frame) -> bytes:
-    header = _dumps(frame.header)
-    inner_len = 1 + 4 + len(header) + len(frame.body)
-    return b"".join(
-        (_U32.pack(inner_len), bytes((frame.kind,)), _U32.pack(len(header)), header, frame.body)
-    )
+    message = frame.message
+    header = MESSAGE.dump_json(message, by_alias=True, exclude={k for k, v in message if v is None})
+    if b"NaN" in header or b"Infinity" in header:
+        json.loads(header, parse_constant=_reject_constant)
+    inner_len = 4 + len(header) + len(frame.body)
+    return b"".join((_U32.pack(inner_len), _U32.pack(len(header)), header, frame.body))
 
 
 def decode(buf: bytes) -> Frame:
-    if len(buf) < 5:
-        raise MalformedFrame("frame shorter than 5 bytes")
-    try:
-        kind = Kind(buf[0])
-    except ValueError:
-        raise MalformedFrame(f"unknown frame kind {buf[0]:#x}") from None
-    (header_len,) = _U32.unpack_from(buf, 1)
-    end = 5 + header_len
+    if len(buf) < 4:
+        raise MalformedFrame("frame shorter than 4 bytes")
+    (header_len,) = _U32.unpack_from(buf)
+    end = 4 + header_len
     if end > len(buf):
         raise MalformedFrame("header length exceeds frame")
     try:
-        header = json.loads(buf[5:end]) if header_len else {}
-    except ValueError as e:
+        message = MESSAGE.validate_json(buf[4:end])
+    except ValidationError as e:
         raise MalformedFrame(f"invalid header: {e}") from None
-    if not isinstance(header, dict):
-        raise MalformedFrame("header is not an object")
-    return Frame(kind, header, bytes(buf[end:]))
+    return Frame(message, bytes(buf[end:]))
 
 
 def _read_exact(stream: BinaryIO, n: int) -> bytes | None:
@@ -139,34 +222,14 @@ def read_frame(stream: BinaryIO, max_size: int = MAX_FRAME_SIZE) -> Frame | None
     return decode(body)
 
 
-def encode_payload(value: Any) -> tuple[str, bytes]:
-    if value is None:
-        return "none", b""
-    if isinstance(value, Raw):
-        return "raw", value.bytes
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return "raw", bytes(value)
-    return "json", _dumps(value)
-
-
-def decode_payload(encoding: str, body: bytes) -> Any:
-    if encoding == "json":
-        return json.loads(body) if body else None
-    if encoding == "raw":
-        return Raw(body)
-    if encoding == "none":
-        return None
-    raise ProtocolError(f"unknown encoding {encoding!r}")
-
-
 class Writer:
     def __init__(self, stream: BinaryIO) -> None:
         self._stream = stream
         self._lock = threading.Lock()
         self.max_size = MAX_FRAME_SIZE
 
-    def write(self, frame: Frame) -> None:
-        data = encode(frame)
+    def write(self, message: Message, body: bytes = b"") -> None:
+        data = encode(Frame(message, body))
         if len(data) - 4 > self.max_size:
             raise FrameTooLarge(len(data) - 4)
         with self._lock:

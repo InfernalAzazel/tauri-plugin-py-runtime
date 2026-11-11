@@ -6,7 +6,8 @@ import pytest
 
 from tauri_runtime.channel import Channel
 from tauri_runtime.command import Command, TauriError, bind_arguments, build_handler, to_snake
-from tauri_runtime.protocol import Kind, Raw, Writer, read_frame
+from tauri_runtime import protocol as wire
+from tauri_runtime.protocol import Frame, Raw, Writer, read_frame
 from tauri_runtime.router import Router
 
 
@@ -97,11 +98,10 @@ async def _channel_scenario():
     with pytest.raises(RuntimeError):
         await channel.send(2)
     out.seek(0)
-    frames = [read_frame(out) for _ in range(3)]
-    assert [(f.kind, f.header) for f in frames] == [
-        (Kind.CHANNEL_DATA, {"channel": 9, "encoding": "json"}),
-        (Kind.CHANNEL_DATA, {"channel": 9, "encoding": "raw"}),
-        (Kind.CHANNEL_CLOSE, {"channel": 9}),
+    assert [read_frame(out) for _ in range(3)] == [
+        Frame(wire.ChannelData(channel=9, value=1)),
+        Frame(wire.ChannelData(channel=9, raw=True), b"\x01"),
+        Frame(wire.ChannelClose(channel=9)),
     ]
 
 

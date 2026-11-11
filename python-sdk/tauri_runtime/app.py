@@ -11,22 +11,21 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, BinaryIO, Callable, NoReturn
 
+from . import protocol as wire
 from .channel import Channel
 from .command import Command, TauriError, bind_arguments, build_handler, to_snake
 from .event import Event, EventBus
 from .protocol import (
     PROTOCOL_VERSION,
-    SDK_VERSION,
     Frame,
     FrameTooLarge,
-    Kind,
     MalformedFrame,
     ProtocolError,
     Raw,
     Writer,
-    decode_payload,
-    encode_payload,
+    join_payload,
     read_frame,
+    split_payload,
     take_over_stdio,
 )
 from .router import Router
@@ -36,9 +35,8 @@ RESERVED_EVENTS = ("exited",)
 DEFAULT_SHUTDOWN_TIMEOUT_S = 3.0
 
 
-def shutdown_budget(header: dict[str, Any]) -> float:
-    """Seconds allowed for shutdown, from a Shutdown frame header; invalid values fall back to 3 s."""
-    value = header.get("timeoutMs")
+def shutdown_budget(value: Any) -> float:
+    """Seconds allowed for shutdown, from a Shutdown `timeoutMs`; invalid values fall back to 3 s."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return DEFAULT_SHUTDOWN_TIMEOUT_S
     if not math.isfinite(value) or value < 0:
@@ -108,11 +106,8 @@ class App:
             raise ValueError(f"event name '{event}' is reserved by the runtime")
         if self._writer is None:
             raise RuntimeError("app is not running")
-        encoding, body = encode_payload(payload)
-        header: dict[str, Any] = {"event": event, "encoding": encoding}
-        if target is not None:
-            header["target"] = target
-        self._writer.write(Frame(Kind.EVENT, header, body))
+        fields, body = split_payload(payload)
+        self._writer.write(wire.Event(event=event, target=target, **fields), body)
 
     # running ------------------------------------------------------------
 
@@ -160,17 +155,15 @@ class App:
             except Exception:
                 traceback.print_exc()
                 return 1
-            self._writer.write(
-                Frame(Kind.HELLO, {"protocol": PROTOCOL_VERSION, "sdk": SDK_VERSION, "commands": self._router.names()})
-            )
+            self._writer.write(wire.Hello(protocol=PROTOCOL_VERSION, commands=self._router.names()))
             while (frame := await self._next_frame(reader_pool, reader)) is not None:
-                if frame.kind == Kind.SHUTDOWN:
-                    budget = shutdown_budget(frame.header)
+                if isinstance(frame.message, wire.Shutdown):
+                    budget = shutdown_budget(frame.message.timeout_ms)
                     break
                 try:
                     self._dispatch(frame)
                 except Exception as e:
-                    print(f"[WARN] dropped {frame.kind.name} frame: {e}", file=sys.stderr)
+                    print(f"[WARN] dropped {frame.message.type} frame: {e}", file=sys.stderr)
             deadline = self._loop.time() + budget
             await self._stop_tasks(budget)
             await self._run_hooks_logged("shutdown", timeout=max(0.0, deadline - self._loop.time()))
@@ -202,16 +195,17 @@ class App:
                 return None
 
     def _dispatch(self, frame: Frame) -> None:
-        if frame.kind == Kind.READY:
-            self._spawn(self._run_hooks_logged("ready"))
-        elif frame.kind == Kind.REQUEST:
-            self._start_call(frame)
-        elif frame.kind == Kind.CANCEL:
-            self._cancel_call(frame.header.get("id"))
-        elif frame.kind == Kind.EVENT:
-            self._deliver_event(frame)
-        else:
-            print(f"[WARN] unexpected frame {frame.kind.name}", file=sys.stderr)
+        match frame.message:
+            case wire.Ready():
+                self._spawn(self._run_hooks_logged("ready"))
+            case wire.Request() as request:
+                self._start_call(request, frame.body)
+            case wire.Cancel(id=call_id):
+                self._cancel_call(call_id)
+            case wire.Event() as event:
+                self._deliver_event(event, frame.body)
+            case other:
+                print(f"[WARN] unexpected frame {other.type}", file=sys.stderr)
 
     # helpers ------------------------------------------------------------
 
@@ -263,17 +257,13 @@ class App:
 
     # calls --------------------------------------------------------------
 
-    def _start_call(self, frame: Frame) -> None:
-        call_id = frame.header.get("id")
-        if not isinstance(call_id, int):
-            print("[WARN] dropped REQUEST frame: missing or invalid id", file=sys.stderr)
-            return
+    def _start_call(self, request: wire.Request, body: bytes) -> None:
+        call_id = request.id
+        ctx = Command(id=call_id, cmd=request.cmd, window=request.window)
         if call_id in self._calls:
-            ctx = Command(id=call_id, cmd=frame.header.get("cmd", ""), window=frame.header.get("window"))
             self._send_error(ctx, "invalid_args", f"duplicate call id {call_id}")
             return
-        ctx = Command(id=call_id, cmd=frame.header.get("cmd", ""), window=frame.header.get("window"))
-        task = self._spawn(self._handle_call(ctx, frame))
+        task = self._spawn(self._handle_call(ctx, request, body))
         self._calls[call_id] = (task, ctx)
 
         def on_done(t: asyncio.Future[Any]) -> None:
@@ -283,20 +273,20 @@ class App:
 
         task.add_done_callback(on_done)
 
-    def _cancel_call(self, call_id: Any) -> None:
+    def _cancel_call(self, call_id: int) -> None:
         entry = self._calls.pop(call_id, None)
         if entry is not None:
             task, ctx = entry
             ctx.cancelled = True
             task.cancel()
 
-    async def _handle_call(self, ctx: Command, frame: Frame) -> None:
+    async def _handle_call(self, ctx: Command, request: wire.Request, body: bytes) -> None:
         channels: dict[str, Channel[Any]] = {}
         try:
-            result = await self._execute(ctx, frame, channels)
+            result = await self._execute(ctx, request, body, channels)
             if not ctx.cancelled:
-                encoding, body = encode_payload(result)
-                self._send(Frame(Kind.RESPONSE, {"id": ctx.id, "encoding": encoding}, body))
+                fields, result_body = split_payload(result)
+                self._send(wire.Response(id=ctx.id, **fields), result_body)
         except asyncio.CancelledError:
             if not ctx.cancelled:
                 self._send_error(ctx, "cancelled", "command was cancelled")
@@ -313,54 +303,49 @@ class App:
             for channel in channels.values():
                 channel.closed = True
 
-    async def _execute(self, ctx: Command, frame: Frame, channels: dict[str, Channel[Any]]) -> Any:
+    async def _execute(
+        self, ctx: Command, request: wire.Request, body: bytes, channels: dict[str, Channel[Any]]
+    ) -> Any:
         handler = self._router.get(ctx.cmd)
         if handler is None:
             raise TauriError("command_not_found", f"command '{ctx.cmd}' not found")
         try:
-            payload = decode_payload(frame.header.get("encoding", "none"), frame.body)
-        except (ValueError, ProtocolError) as e:
+            payload = join_payload(request, body)
+        except ProtocolError as e:
             raise TauriError("invalid_args", f"invalid request body: {e}") from e
         raw = payload if isinstance(payload, Raw) else None
         args = None if raw is not None else payload
         assert self._writer is not None
-        for name, channel_id in (frame.header.get("channels") or {}).items():
+        for name, channel_id in request.channels.items():
             channels[to_snake(name)] = Channel(channel_id, self._writer)
         kwargs = bind_arguments(handler, args, raw, channels, ctx, self)
         return await self._invoke(handler.func, **kwargs)
 
-    def _send(self, frame: Frame) -> None:
+    def _send(self, message: wire.Message, body: bytes = b"") -> None:
         if self._writer is not None:
-            self._writer.write(frame)
+            self._writer.write(message, body)
 
     def _send_error(self, ctx: Command, code: str, message: str, data: Any = None) -> None:
         if ctx.cancelled:
             return
-        header: dict[str, Any] = {"id": ctx.id, "code": code, "message": message}
-        if data is not None:
-            header["data"] = data
+        error = wire.Error(id=ctx.id, code=code, message=message, data=data)
         try:
-            self._send(Frame(Kind.ERROR, header))
-        except (TypeError, ValueError, FrameTooLarge) as e:
-            if "data" not in header:
+            self._send(error)
+        except (ValueError, FrameTooLarge) as e:
+            if data is None:
                 raise
             print(f"[WARN] dropped error data for call {ctx.id}: {e}", file=sys.stderr)
-            del header["data"]
-            self._send(Frame(Kind.ERROR, header))
+            self._send(error.model_copy(update={"data": None}))
 
     # events -------------------------------------------------------------
 
-    def _deliver_event(self, frame: Frame) -> None:
+    def _deliver_event(self, message: wire.Event, body: bytes) -> None:
         try:
-            payload = decode_payload(frame.header.get("encoding", "none"), frame.body)
-        except (ValueError, ProtocolError) as e:
+            payload = join_payload(message, body)
+        except ProtocolError as e:
             print(f"[WARN] dropped event frame: {e}", file=sys.stderr)
             return
-        event = Event(
-            frame.header.get("event", ""),
-            payload,
-            frame.header.get("window"),
-        )
+        event = Event(message.event, payload, message.window)
         for func in self._events.get(event.name):
             self._spawn(self._run_listener(func, event))
 

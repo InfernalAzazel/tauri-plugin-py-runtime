@@ -64,10 +64,7 @@ struct TauriSink<R: Runtime>(AppHandle<R>);
 fn payload_to_value(payload: Payload) -> Value {
   match payload {
     Payload::None => Value::Null,
-    Payload::Json(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
-      log::warn!(target: "py-runtime", "invalid JSON event payload from python: {e}");
-      Value::Null
-    }),
+    Payload::Json(value) => value,
     Payload::Raw(bytes) => Value::from(bytes),
   }
 }

@@ -22,7 +22,7 @@ const HEADER_CHANNELS: &str = "x-py-channels";
 pub(crate) fn to_response_body(payload: Payload) -> InvokeResponseBody {
   match payload {
     Payload::None => InvokeResponseBody::Json("null".into()),
-    Payload::Json(json) => InvokeResponseBody::Json(json),
+    Payload::Json(value) => InvokeResponseBody::Json(value.to_string()),
     Payload::Raw(bytes) => InvokeResponseBody::Raw(bytes),
   }
 }
@@ -92,7 +92,7 @@ pub(crate) async fn invoke<R: Runtime>(
   };
   let args = match request.body() {
     InvokeBody::Json(value) if value.is_null() => Payload::None,
-    InvokeBody::Json(value) => Payload::json(value),
+    InvokeBody::Json(value) => Payload::Json(value.clone()),
     InvokeBody::Raw(bytes) => Payload::Raw(bytes.clone()),
   };
   let opts = CallOptions {
@@ -117,7 +117,7 @@ pub(crate) fn emit<R: Runtime>(
   event: String,
   payload: Option<serde_json::Value>,
 ) -> Result<()> {
-  let payload = payload.map(|v| Payload::json(&v)).unwrap_or(Payload::None);
+  let payload = payload.map_or(Payload::None, Payload::Json);
   state.supervisor().emit(&event, payload, Some(webview.label()))
 }
 

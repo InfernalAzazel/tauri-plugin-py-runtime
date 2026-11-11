@@ -10,9 +10,8 @@ use tokio_util::{codec::FramedRead, sync::CancellationToken};
 
 use crate::{
   bridge::{
-    header,
-    protocol::{FrameCodec, PROTOCOL_VERSION},
-    Bridge, CallOptions, ChannelSink, EventSink, Frame, FrameKind, Payload, Writer,
+    protocol::{AppInfo, FrameCodec, PROTOCOL_VERSION},
+    Bridge, CallOptions, ChannelSink, EventSink, Frame, Message, Payload, Writer,
   },
   error::{codes, Error, Result},
   runtime::process::{self, ProcessConfig, Spawned},
@@ -145,15 +144,21 @@ impl Supervisor {
       _ = self.stop.cancelled() => return self.stop_child(child).await,
     };
     let failure = match handshake {
-      Ok(Some(Ok(Ok(hello)))) if hello.kind == FrameKind::Hello => match hello.header::<header::Hello>().ok() {
-        Some(header::Hello { protocol: PROTOCOL_VERSION }) => None,
-        other => Some((
-          codes::PROTOCOL_MISMATCH,
-          format!("python sdk speaks protocol {:?}, expected {PROTOCOL_VERSION}", other.map(|h| h.protocol)),
-        )),
-      },
-      Ok(Some(Ok(Ok(frame)))) => Some((codes::RUNTIME_UNAVAILABLE, format!("expected Hello, got {:?}", frame.kind))),
-      Ok(Some(Ok(Err(e)) | Err(e))) => Some((codes::RUNTIME_UNAVAILABLE, format!("handshake failed: {e}"))),
+      Ok(Some(Ok(Ok(Frame { message: Message::Hello { protocol, sdk, commands }, .. })))) => {
+        if protocol == PROTOCOL_VERSION {
+          log::debug!(target: "py-runtime", "python sdk {sdk} registered {} command(s)", commands.len());
+          None
+        } else {
+          let message = format!("python sdk speaks protocol {protocol}, expected {PROTOCOL_VERSION}");
+          Some((codes::PROTOCOL_MISMATCH, message))
+        }
+      }
+      Ok(Some(Ok(Ok(frame)))) => {
+        Some((codes::RUNTIME_UNAVAILABLE, format!("expected hello, got {}", <&str>::from(&frame.message))))
+      }
+      // An undecodable first frame most likely comes from an SDK speaking another protocol version.
+      Ok(Some(Ok(Err(e)))) => Some((codes::PROTOCOL_MISMATCH, format!("could not decode handshake: {e}"))),
+      Ok(Some(Err(e))) => Some((codes::RUNTIME_UNAVAILABLE, format!("handshake failed: {e}"))),
       Ok(None) => Some((codes::RUNTIME_UNAVAILABLE, "python exited before handshake".into())),
       Err(_) => Some((codes::RUNTIME_UNAVAILABLE, "handshake timed out".into())),
     };
@@ -163,8 +168,8 @@ impl Supervisor {
       return Exit::Failed;
     }
 
-    let app = header::AppInfo { name: self.config.app_name.clone(), version: self.config.app_version.clone() };
-    let _ = writer.send(Frame::new(FrameKind::Ready, &header::Ready { protocol: PROTOCOL_VERSION, app }));
+    let app = AppInfo { name: self.config.app_name.clone(), version: self.config.app_version.clone() };
+    let _ = writer.send(Frame::new(Message::Ready { protocol: PROTOCOL_VERSION, app }));
     *self.writer.lock().unwrap() = Some(writer);
     // Checked after publishing the writer: a concurrent shutdown either took it (and sent
     // Shutdown) or cancelled `stop` before we got here.
@@ -280,8 +285,9 @@ impl Supervisor {
       .unwrap()
       .clone()
       .ok_or_else(|| Error::new(codes::RUNTIME_UNAVAILABLE, "python runtime is not running"))?;
-    let header = header::Event { event: event.into(), target: None, window: window.map(Into::into) };
-    writer.send(Frame::with_payload(FrameKind::Event, &header, payload))
+    let (payload, body) = payload.split();
+    let message = Message::Event { event: event.into(), target: None, window: window.map(Into::into), payload };
+    writer.send(Frame { message, body })
   }
 
   pub async fn shutdown(&self) {
@@ -291,7 +297,7 @@ impl Supervisor {
     match writer {
       Some(writer) => {
         let timeout_ms = self.config.shutdown_timeout.as_millis() as u64;
-        let _ = writer.send(Frame::new(FrameKind::Shutdown, &header::Shutdown { timeout_ms }));
+        let _ = writer.send(Frame::new(Message::Shutdown { timeout_ms }));
       }
       None if !matches!(self.status(), Status::Starting | Status::Running) => return,
       None => {}

@@ -8,7 +8,8 @@ import textwrap
 import time
 from pathlib import Path
 
-from tauri_runtime.protocol import Frame, Kind, encode, read_frame
+from tauri_runtime import protocol as wire
+from tauri_runtime.protocol import Frame, encode, read_frame
 
 SDK_ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,7 +38,7 @@ def test_print_and_fd_writes_go_to_stderr(tmp_path):
     proc = subprocess.run([sys.executable, str(script)], input=b"", capture_output=True, env=env, timeout=10)
     assert proc.returncode == 0, proc.stderr.decode()
     stdout = io.BytesIO(proc.stdout)
-    assert read_frame(stdout).kind == Kind.HELLO
+    assert read_frame(stdout).message.type == "hello"
     assert read_frame(stdout) is None
     assert b"hello from print" in proc.stderr
     assert b"raw fd write" in proc.stderr
@@ -54,12 +55,12 @@ def spawn_app(tmp_path, source):
         stderr=subprocess.PIPE,
         env=env,
     )
-    assert read_frame(proc.stdout).kind == Kind.HELLO
+    assert read_frame(proc.stdout).message.type == "hello"
     return proc
 
 
-def send(proc, kind, header, body=b""):
-    proc.stdin.write(encode(Frame(kind, header, body)))
+def send(proc, message):
+    proc.stdin.write(encode(Frame(message)))
     proc.stdin.flush()
 
 
@@ -92,9 +93,9 @@ def test_handler_calling_sys_exit_still_exits(tmp_path):
         app.run()
         """,
     )
-    send(proc, Kind.REQUEST, {"id": 1, "cmd": "stuck", "encoding": "none", "window": "main"})
+    send(proc, wire.Request(id=1, cmd="stuck", window="main"))
     time.sleep(0.2)
-    send(proc, Kind.REQUEST, {"id": 2, "cmd": "quit", "encoding": "none", "window": "main"})
+    send(proc, wire.Request(id=2, cmd="quit", window="main"))
     code = wait_exit(proc, 5)
     proc.stdin.close()
     assert code == 7
@@ -125,10 +126,10 @@ def test_malformed_shutdown_with_stubborn_handler_exits(tmp_path):
         app.run()
         """,
     )
-    send(proc, Kind.REQUEST, {"id": 1, "cmd": "stubborn", "encoding": "none", "window": "main"})
-    send(proc, Kind.REQUEST, {"id": 2, "cmd": "stuck", "encoding": "none", "window": "main"})
+    send(proc, wire.Request(id=1, cmd="stubborn", window="main"))
+    send(proc, wire.Request(id=2, cmd="stuck", window="main"))
     time.sleep(0.3)
-    send(proc, Kind.SHUTDOWN, {"timeoutMs": "later"})
+    send(proc, wire.Shutdown(timeout_ms="later"))
     proc.stdin.close()
     started = time.monotonic()
     assert wait_exit(proc, 8) == 0
@@ -162,21 +163,10 @@ def test_shutdown_exits_despite_slow_sync_handler(tmp_path):
         stderr=subprocess.PIPE,
         env=env,
     )
-    hello = read_frame(proc.stdout)
-    assert hello.kind == Kind.HELLO
-    proc.stdin.write(
-        encode(
-            Frame(
-                Kind.REQUEST,
-                {"id": 1, "cmd": "slow", "encoding": "none", "window": "main"},
-                b"",
-            )
-        )
-    )
-    proc.stdin.flush()
+    assert read_frame(proc.stdout).message.type == "hello"
+    send(proc, wire.Request(id=1, cmd="slow", window="main"))
     time.sleep(0.3)
-    proc.stdin.write(encode(Frame(Kind.SHUTDOWN, {"timeoutMs": 1000}, b"")))
-    proc.stdin.flush()
+    send(proc, wire.Shutdown(timeout_ms=1000))
     proc.stdin.close()
     try:
         proc.wait(timeout=2)

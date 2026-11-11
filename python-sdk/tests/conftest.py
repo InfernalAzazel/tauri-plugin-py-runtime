@@ -1,10 +1,15 @@
-import json
 import os
 import threading
 
 import pytest
 
-from tauri_runtime.protocol import Frame, Kind, encode, read_frame
+from tauri_runtime import protocol as wire
+from tauri_runtime.protocol import Frame, encode, read_frame
+
+
+def raw_frame(header: bytes, body: bytes = b"") -> bytes:
+    """A frame with an arbitrary (possibly invalid) header."""
+    return (4 + len(header) + len(body)).to_bytes(4, "big") + len(header).to_bytes(4, "big") + header + body
 
 
 class Harness:
@@ -28,21 +33,18 @@ class Harness:
         finally:
             self._app_out.close()
 
-    def send(self, kind, header=None, body=b""):
-        self._to_app.write(encode(Frame(kind, header or {}, body)))
+    def send(self, message, body=b""):
+        self.send_bytes(encode(Frame(message, body)))
+
+    def send_bytes(self, data):
+        self._to_app.write(data)
         self._to_app.flush()
 
     def request(self, call_id, cmd, args=None, *, raw=None, channels=None):
-        header = {"id": call_id, "cmd": cmd, "window": "main"}
-        if channels:
-            header["channels"] = channels
+        message = wire.Request(id=call_id, cmd=cmd, window="main", channels=channels or {}, value=args)
         if raw is not None:
-            header["encoding"], body = "raw", raw
-        elif args is not None:
-            header["encoding"], body = "json", json.dumps(args).encode()
-        else:
-            header["encoding"], body = "none", b""
-        self.send(Kind.REQUEST, header, body)
+            message.raw = True
+        self.send(message, raw or b"")
 
     def recv(self, timeout=5.0):
         result = {}

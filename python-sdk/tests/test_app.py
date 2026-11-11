@@ -1,11 +1,13 @@
 import asyncio
-import json
 import time
 
 import pytest
 
+from conftest import raw_frame
+
 from tauri_runtime import App, Channel, Command, Event, Raw, TauriError
-from tauri_runtime.protocol import PROTOCOL_VERSION, Kind, encode
+from tauri_runtime import protocol as wire
+from tauri_runtime.protocol import PROTOCOL_VERSION, Frame, encode
 
 
 def base_app():
@@ -20,18 +22,13 @@ def base_app():
 
 def test_hello_frame_lists_commands(harness):
     h = harness(base_app())
-    assert h.hello.kind == Kind.HELLO
-    assert h.hello.header["protocol"] == PROTOCOL_VERSION
-    assert h.hello.header["commands"] == ["hello"]
+    assert h.hello.message == wire.Hello(protocol=PROTOCOL_VERSION, commands=["hello"])
 
 
 def test_json_call(harness):
     h = harness(base_app())
     h.request(1, "hello", {"name": "Kylin"})
-    f = h.recv()
-    assert f.kind == Kind.RESPONSE
-    assert f.header == {"id": 1, "encoding": "json"}
-    assert json.loads(f.body) == "Hello Kylin"
+    assert h.recv() == Frame(wire.Response(id=1, value="Hello Kylin"))
 
 
 def test_raw_call_and_none_result(harness):
@@ -47,11 +44,9 @@ def test_raw_call_and_none_result(harness):
 
     h = harness(app)
     h.request(1, "reverse", raw=b"\x00\x01\x02")
-    f = h.recv()
-    assert f.header == {"id": 1, "encoding": "raw"}
-    assert f.body == b"\x02\x01\x00"
+    assert h.recv() == Frame(wire.Response(id=1, raw=True), b"\x02\x01\x00")
     h.request(2, "noop")
-    assert h.recv().header == {"id": 2, "encoding": "none"}
+    assert h.recv() == Frame(wire.Response(id=2))
 
 
 def test_sync_handler_does_not_block_async(harness):
@@ -69,21 +64,19 @@ def test_sync_handler_does_not_block_async(harness):
     h = harness(app)
     h.request(1, "slow")
     h.request(2, "fast")
-    assert [h.recv().header["id"], h.recv().header["id"]] == [2, 1]
+    assert [h.recv().message.id, h.recv().message.id] == [2, 1]
 
 
 def test_command_not_found(harness):
     h = harness(base_app())
     h.request(1, "missing")
-    f = h.recv()
-    assert f.kind == Kind.ERROR
-    assert f.header["code"] == "command_not_found"
+    assert h.recv().message.code == "command_not_found"
 
 
 def test_invalid_args(harness):
     h = harness(base_app())
     h.request(1, "hello", {})
-    assert h.recv().header["code"] == "invalid_args"
+    assert h.recv().message.code == "invalid_args"
 
 
 def test_tauri_error_and_unexpected_exception(harness):
@@ -99,12 +92,10 @@ def test_tauri_error_and_unexpected_exception(harness):
 
     h = harness(app)
     h.request(1, "denied")
-    assert h.recv().header == {"id": 1, "code": "not_allowed", "message": "nope", "data": {"k": 1}}
+    assert h.recv().message == wire.Error(id=1, code="not_allowed", message="nope", data={"k": 1})
     h.request(2, "boom")
-    f = h.recv()
-    assert f.header["code"] == "internal"
-    assert f.header["message"] == "ValueError: boom"
-    assert f.header["data"] == {"type": "ValueError"}
+    error = wire.Error(id=2, code="internal", message="ValueError: boom", data={"type": "ValueError"})
+    assert h.recv().message == error
 
 
 def test_cancel_suppresses_response(harness):
@@ -117,9 +108,9 @@ def test_cancel_suppresses_response(harness):
 
     h = harness(app)
     h.request(1, "wait")
-    h.send(Kind.CANCEL, {"id": 1, "reason": "client"})
+    h.send(wire.Cancel(id=1, reason="client"))
     h.request(2, "hello", {"name": "x"})
-    assert h.recv().header["id"] == 2
+    assert h.recv().message.id == 2
 
 
 def test_channel_streams_before_response(harness):
@@ -134,9 +125,12 @@ def test_channel_streams_before_response(harness):
     h = harness(app)
     h.request(1, "count", {"n": 3}, channels={"onItem": 7})
     frames = [h.recv() for _ in range(4)]
-    assert [(f.kind, f.header.get("channel")) for f in frames[:3]] == [(Kind.CHANNEL_DATA, 7)] * 3
-    assert [json.loads(f.body) for f in frames[:3]] == [0, 1, 2]
-    assert frames[3].kind == Kind.RESPONSE
+    assert [f.message for f in frames] == [
+        wire.ChannelData(channel=7, value=0),
+        wire.ChannelData(channel=7, value=1),
+        wire.ChannelData(channel=7, value=2),
+        wire.Response(id=1, value=3),
+    ]
 
 
 def test_events_roundtrip(harness):
@@ -147,11 +141,8 @@ def test_events_roundtrip(harness):
         await app.emit("welcome", {"user": event.payload["name"]}, target=event.window)
 
     h = harness(app)
-    h.send(Kind.EVENT, {"event": "user:login", "encoding": "json", "window": "main"}, b'{"name":"Ky"}')
-    f = h.recv()
-    assert f.kind == Kind.EVENT
-    assert f.header == {"event": "welcome", "encoding": "json", "target": "main"}
-    assert json.loads(f.body) == {"user": "Ky"}
+    h.send(wire.Event(event="user:login", window="main", value={"name": "Ky"}))
+    assert h.recv() == Frame(wire.Event(event="welcome", target="main", value={"user": "Ky"}))
 
 
 def test_lifecycle_hooks(harness):
@@ -172,10 +163,10 @@ def test_lifecycle_hooks(harness):
 
     h = harness(app)
     assert calls == ["startup"]
-    h.send(Kind.READY, {"protocol": PROTOCOL_VERSION})
+    h.send(wire.Ready(protocol=PROTOCOL_VERSION, app=wire.AppInfo(name="app", version="1.0.0")))
     h.request(1, "hello", {"name": "x"})
     h.recv()
-    h.send(Kind.SHUTDOWN, {"timeoutMs": 1000})
+    h.send(wire.Shutdown(timeout_ms=1000))
     h.thread.join(5)
     assert calls == ["startup", "ready", "shutdown"]
     assert h.exit_code == 0
@@ -212,33 +203,33 @@ def test_malformed_event_dropped_hello_still_works(harness):
         raise AssertionError("listener should not run")
 
     h = harness(app)
-    h.send(Kind.EVENT, {"event": "e", "encoding": "json"}, b"{not json")
+    h.send(wire.Event(event="e", value=1), b"unexpected body")
+    h.send_bytes(raw_frame(b'{"type":"event","event":"e","value":{not json}'))
     h.request(1, "hello", {"name": "Ky"})
-    f = h.recv()
-    assert f.kind == Kind.RESPONSE
-    assert json.loads(f.body) == "Hello Ky"
+    assert h.recv() == Frame(wire.Response(id=1, value="Hello Ky"))
 
 
-def test_request_without_id_dropped_hello_still_works(harness):
+@pytest.mark.parametrize(
+    "header",
+    [
+        b'{"type":"request","cmd":"hello","window":"main","value":{"name":"x"}}',
+        b'{"type":"request","id":"1","cmd":"hello"}',
+        b'{"type":"teleport","id":1}',
+    ],
+)
+def test_malformed_request_dropped_hello_still_works(harness, header):
     h = harness(base_app())
-    h.send(Kind.REQUEST, {"cmd": "hello", "encoding": "json", "window": "main"}, b'{"name":"x"}')
+    h.send_bytes(raw_frame(header))
     h.request(1, "hello", {"name": "Ky"})
-    f = h.recv()
-    assert f.kind == Kind.RESPONSE
-    assert json.loads(f.body) == "Hello Ky"
+    assert h.recv() == Frame(wire.Response(id=1, value="Hello Ky"))
 
 
-def test_invalid_json_body_invalid_args(harness):
+def test_body_without_raw_flag_is_invalid_args(harness):
     h = harness(base_app())
-    h.send(
-        Kind.REQUEST,
-        {"id": 1, "cmd": "hello", "encoding": "json", "window": "main"},
-        b"{bad",
-    )
+    h.send(wire.Request(id=1, cmd="hello", window="main", value={"name": "x"}), b"{bad")
     f = h.recv()
-    assert f.kind == Kind.ERROR
-    assert f.header["code"] == "invalid_args"
-    assert "invalid request body" in f.header["message"]
+    assert f.message.code == "invalid_args"
+    assert "invalid request body" in f.message.message
 
 
 def test_handler_cancelled_error_returns_cancelled(harness):
@@ -250,9 +241,7 @@ def test_handler_cancelled_error_returns_cancelled(harness):
 
     h = harness(app)
     h.request(1, "bail")
-    f = h.recv()
-    assert f.kind == Kind.ERROR
-    assert f.header == {"id": 1, "code": "cancelled", "message": "command was cancelled"}
+    assert h.recv().message == wire.Error(id=1, code="cancelled", message="command was cancelled")
 
 
 def test_duplicate_call_id(harness):
@@ -266,16 +255,12 @@ def test_duplicate_call_id(harness):
     h = harness(app)
     h.request(1, "linger")
     h.request(1, "hello", {"name": "x"})
-    f = h.recv()
-    assert f.kind == Kind.ERROR
-    assert f.header["id"] == 1
-    assert f.header["code"] == "invalid_args"
-    assert "duplicate call id" in f.header["message"]
-    h.send(Kind.CANCEL, {"id": 1, "reason": "client"})
+    f = h.recv().message
+    assert (f.type, f.id, f.code) == ("error", 1, "invalid_args")
+    assert "duplicate call id" in f.message
+    h.send(wire.Cancel(id=1, reason="client"))
     h.request(2, "hello", {"name": "ok"})
-    f2 = h.recv()
-    assert f2.kind == Kind.RESPONSE
-    assert json.loads(f2.body) == "Hello ok"
+    assert h.recv() == Frame(wire.Response(id=2, value="Hello ok"))
 
 
 def stubborn_app():
@@ -298,7 +283,7 @@ def test_handler_swallowing_cancel_does_not_block_shutdown(harness):
     h.request(2, "hello", {"name": "x"})
     h.recv()
     started = time.monotonic()
-    h.send(Kind.SHUTDOWN, {"timeoutMs": 300})
+    h.send(wire.Shutdown(timeout_ms=300))
     h.thread.join(5)
     assert not h.thread.is_alive()
     assert time.monotonic() - started < 2
@@ -327,7 +312,7 @@ def test_invalid_shutdown_timeout_is_tolerated(harness, timeout_ms):
         calls.append("shutdown")
 
     h = harness(app)
-    h.send(Kind.SHUTDOWN, {"timeoutMs": timeout_ms})
+    h.send(wire.Shutdown(timeout_ms=timeout_ms))
     h.thread.join(5)
     assert h.exit_code == 0
     assert calls == ["shutdown"]
@@ -336,11 +321,10 @@ def test_invalid_shutdown_timeout_is_tolerated(harness, timeout_ms):
 def test_shutdown_budget_parsing():
     from tauri_runtime.app import shutdown_budget
 
-    assert shutdown_budget({}) == 3.0
-    assert shutdown_budget({"timeoutMs": 1500}) == 1.5
-    assert shutdown_budget({"timeoutMs": 0}) == 0.0
+    assert shutdown_budget(1500) == 1.5
+    assert shutdown_budget(0) == 0.0
     for bad in ("soon", -5, None, True, float("inf"), float("nan")):
-        assert shutdown_budget({"timeoutMs": bad}) == 3.0
+        assert shutdown_budget(bad) == 3.0
 
 
 def test_nan_result_is_internal_error(harness):
@@ -352,9 +336,7 @@ def test_nan_result_is_internal_error(harness):
 
     h = harness(app)
     h.request(1, "nan")
-    f = h.recv()
-    assert f.kind == Kind.ERROR
-    assert f.header["code"] == "internal"
+    assert h.recv().message.code == "internal"
 
 
 def test_unserializable_error_data_falls_back(harness, capfd):
@@ -366,9 +348,7 @@ def test_unserializable_error_data_falls_back(harness, capfd):
 
     h = harness(app)
     h.request(1, "odd")
-    f = h.recv()
-    assert f.kind == Kind.ERROR
-    assert f.header == {"id": 1, "code": "odd", "message": "bad data"}
+    assert h.recv().message == wire.Error(id=1, code="odd", message="bad data")
     assert "[WARN]" in capfd.readouterr().err
 
 
@@ -390,10 +370,8 @@ def test_exited_event_name_is_reserved(harness):
 
 
 def test_truncated_frame_exit_code_2(harness):
-    from tauri_runtime.protocol import Frame
-
     h = harness(base_app())
-    partial = encode(Frame(Kind.REQUEST, {"id": 1, "cmd": "hello", "encoding": "none"}, b""))[:6]
+    partial = encode(Frame(wire.Request(id=1, cmd="hello")))[:6]
     h._to_app.write(partial)
     h._to_app.flush()
     h._to_app.close()

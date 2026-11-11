@@ -66,7 +66,7 @@ fn start(recorder: Arc<Recorder>) -> Arc<Supervisor> {
 }
 
 fn json_payload(value: serde_json::Value) -> Payload {
-  Payload::json(&value)
+  Payload::Json(value)
 }
 
 async fn wait_for(supervisor: &Supervisor, status: Status) {
@@ -81,7 +81,7 @@ async fn wait_for(supervisor: &Supervisor, status: Status) {
 async fn json_and_raw_calls() {
   let sup = start(Default::default());
   let out = sup.call("hello", json_payload(json!({"name": "Kylin"})), vec![], CallOptions::default()).await.unwrap();
-  assert_eq!(out, Payload::Json("\"Hello Kylin\"".into()));
+  assert_eq!(out, Payload::Json(json!("Hello Kylin")));
   let out = sup.call("reverse", Payload::Raw(vec![1, 2, 3]), vec![], CallOptions::default()).await.unwrap();
   assert_eq!(out, Payload::Raw(vec![3, 2, 1]));
   sup.shutdown().await;
@@ -98,8 +98,8 @@ async fn concurrent_calls_do_not_block_each_other() {
     (result, started.elapsed())
   };
   let (slow, (fast, fast_elapsed)) = tokio::join!(slow, fast);
-  assert_eq!(slow.unwrap(), Payload::Json("500".into()));
-  assert_eq!(fast.unwrap(), Payload::Json("10".into()));
+  assert_eq!(slow.unwrap(), Payload::Json(json!(500)));
+  assert_eq!(fast.unwrap(), Payload::Json(json!(10)));
   assert!(fast_elapsed < Duration::from_millis(400), "fast call took {fast_elapsed:?}");
   sup.shutdown().await;
 }
@@ -132,7 +132,7 @@ async fn timeout_and_cancel() {
   assert_eq!(result.unwrap_err().code, "cancelled");
 
   let out = sup.call("hello", json_payload(json!({"name": "again"})), vec![], CallOptions::default()).await.unwrap();
-  assert_eq!(out, Payload::Json("\"Hello again\"".into()));
+  assert_eq!(out, Payload::Json(json!("Hello again")));
   sup.shutdown().await;
 }
 
@@ -146,10 +146,10 @@ async fn channel_streams_items() {
     .call("count", json_payload(json!({"n": 3})), vec![("onItem".into(), sink)], CallOptions::default())
     .await
     .unwrap();
-  assert_eq!(out, Payload::Json("3".into()));
+  assert_eq!(out, Payload::Json(json!(3)));
   assert_eq!(
     *items.lock().unwrap(),
-    vec![Payload::Json("0".into()), Payload::Json("1".into()), Payload::Json("2".into())]
+    vec![Payload::Json(json!(0)), Payload::Json(json!(1)), Payload::Json(json!(2))]
   );
   sup.shutdown().await;
 }
@@ -167,7 +167,7 @@ async fn events_roundtrip() {
   }
   assert_eq!(
     recorder.events.lock().unwrap()[0],
-    ("pong".to_string(), Some("main".to_string()), Payload::Json("{\"a\":1}".into()))
+    ("pong".to_string(), Some("main".to_string()), Payload::Json(json!({"a":1})))
   );
   sup.shutdown().await;
 }
@@ -200,8 +200,24 @@ async fn handshake_failure_marks_failed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn protocol_mismatch_is_reported() {
   let script = "import sys\n\
-from tauri_runtime.protocol import Frame, Kind, encode\n\
-sys.stdout.buffer.write(encode(Frame(Kind.HELLO, {'protocol': 99})))\n\
+from tauri_runtime.protocol import Frame, Hello, encode\n\
+sys.stdout.buffer.write(encode(Frame(Hello(protocol=99))))\n\
+sys.stdout.buffer.flush()\n\
+sys.stdin.read()\n";
+  let sup = Supervisor::new(config(vec!["-c".into(), script.into()]), Arc::new(Recorder::default()));
+  sup.start();
+  let err = sup.call("hello", Payload::None, vec![], CallOptions::default()).await.unwrap_err();
+  assert_eq!(err.code, "protocol_mismatch", "error was {err:?}");
+  assert_eq!(sup.status(), Status::Failed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn undecodable_handshake_is_protocol_mismatch() {
+  // A protocol 1 Hello: kind byte 0x01, then the header length and header.
+  let script = "import sys\n\
+header = b'{\"protocol\":1}'\n\
+frame = b'\\x01' + len(header).to_bytes(4, 'big') + header\n\
+sys.stdout.buffer.write(len(frame).to_bytes(4, 'big') + frame)\n\
 sys.stdout.buffer.flush()\n\
 sys.stdin.read()\n";
   let sup = Supervisor::new(config(vec!["-c".into(), script.into()]), Arc::new(Recorder::default()));
@@ -214,8 +230,8 @@ sys.stdin.read()\n";
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_kills_unresponsive_runtime() {
   let script = "import sys, time\n\
-from tauri_runtime.protocol import Frame, Kind, encode\n\
-sys.stdout.buffer.write(encode(Frame(Kind.HELLO, {'protocol': 1})))\n\
+from tauri_runtime.protocol import PROTOCOL_VERSION, Frame, Hello, encode\n\
+sys.stdout.buffer.write(encode(Frame(Hello(protocol=PROTOCOL_VERSION))))\n\
 sys.stdout.buffer.flush()\n\
 time.sleep(60)\n";
   let mut cfg = config(vec!["-c".into(), script.into()]);
@@ -245,7 +261,7 @@ async fn shutdown_during_startup_stops_runtime() {
 async fn non_utf8_stderr_does_not_block() {
   let sup = start(Default::default());
   let out = sup.call("noisy", Payload::None, vec![], CallOptions::default()).await.unwrap();
-  assert_eq!(out, Payload::Json("\"ok\"".into()));
+  assert_eq!(out, Payload::Json(json!("ok")));
   sup.shutdown().await;
 }
 
@@ -260,7 +276,7 @@ async fn restart_on_crash_recovers() {
   let err = sup.call("crash", Payload::None, vec![], CallOptions::default()).await.unwrap_err();
   assert_eq!(err.code, "runtime_exited");
   let out = sup.call("hello", json_payload(json!({"name": "back"})), vec![], CallOptions::default()).await.unwrap();
-  assert_eq!(out, Payload::Json("\"Hello back\"".into()));
+  assert_eq!(out, Payload::Json(json!("Hello back")));
   assert_eq!(*recorder.exits.lock().unwrap(), vec![Some(3)]);
   sup.shutdown().await;
   assert_eq!(sup.status(), Status::Stopped);

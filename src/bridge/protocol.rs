@@ -1,28 +1,14 @@
-use bytes::{BufMut, BytesMut};
-use num_enum::{IntoPrimitive, TryFromPrimitive};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::{Map, Value};
-use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec, LengthDelimitedCodecError};
+use std::collections::BTreeMap;
+
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio_util::codec::{Decoder, LengthDelimitedCodec, LengthDelimitedCodecError};
 
 use crate::error::{codes, Error};
 
-pub const PROTOCOL_VERSION: u64 = 1;
+pub const PROTOCOL_VERSION: u64 = 2;
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
-#[repr(u8)]
-pub enum FrameKind {
-  Hello = 0x01,
-  Ready = 0x02,
-  Shutdown = 0x03,
-  Request = 0x10,
-  Response = 0x11,
-  Error = 0x12,
-  Cancel = 0x13,
-  Event = 0x20,
-  ChannelData = 0x30,
-  ChannelClose = 0x31,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -43,136 +29,173 @@ impl From<ProtocolError> for Error {
   }
 }
 
-/// Body encoding, sent as the `encoding` header field; a missing field means `none`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Encoding {
-  #[default]
-  None,
-  Json,
-  Raw,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppInfo {
+  pub name: String,
+  pub version: String,
+}
+
+/// Payload fields of a message: a JSON payload travels inline as `value`, a binary payload in
+/// the frame body flagged with `raw: true`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Inline {
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub value: Option<Value>,
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub raw: bool,
+}
+
+/// The frame header. Field order is the wire order and matches the Python models; unknown
+/// fields are ignored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, strum::IntoStaticStr)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum Message {
+  Hello {
+    protocol: u64,
+    #[serde(default)]
+    sdk: String,
+    #[serde(default)]
+    commands: Vec<String>,
+  },
+  Ready {
+    protocol: u64,
+    app: AppInfo,
+  },
+  Shutdown {
+    #[serde(rename = "timeoutMs")]
+    timeout_ms: u64,
+  },
+  Request {
+    id: u64,
+    cmd: String,
+    /// Argument name → channel id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    channels: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window: Option<String>,
+    #[serde(flatten)]
+    payload: Inline,
+  },
+  Response {
+    id: u64,
+    #[serde(flatten)]
+    payload: Inline,
+  },
+  Error {
+    id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
+  },
+  Cancel {
+    id: u64,
+    reason: String,
+  },
+  /// Python → Rust events carry `target`, Rust → Python events carry `window`.
+  Event {
+    event: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window: Option<String>,
+    #[serde(flatten)]
+    payload: Inline,
+  },
+  ChannelData {
+    channel: u64,
+    #[serde(flatten)]
+    payload: Inline,
+  },
+  ChannelClose {
+    channel: u64,
+  },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Payload {
   None,
-  Json(String),
+  Json(Value),
   Raw(Vec<u8>),
 }
 
 impl Payload {
-  pub fn json(value: &Value) -> Self {
-    Self::Json(value.to_string())
-  }
-
-  pub fn encoding(&self) -> Encoding {
+  /// Message fields and frame body for this payload.
+  pub fn split(self) -> (Inline, Vec<u8>) {
     match self {
-      Self::None => Encoding::None,
-      Self::Json(_) => Encoding::Json,
-      Self::Raw(_) => Encoding::Raw,
-    }
-  }
-
-  pub fn into_body(self) -> Vec<u8> {
-    match self {
-      Self::None => Vec::new(),
-      Self::Json(s) => s.into_bytes(),
-      Self::Raw(b) => b,
-    }
-  }
-
-  pub fn from_wire(encoding: Encoding, body: Vec<u8>) -> Result<Self, ProtocolError> {
-    match encoding {
-      Encoding::None => Ok(Self::None),
-      Encoding::Raw => Ok(Self::Raw(body)),
-      Encoding::Json => String::from_utf8(body)
-        .map(Self::Json)
-        .map_err(|_| ProtocolError::Malformed("json body is not utf-8".into())),
+      Self::None => (Inline::default(), Vec::new()),
+      Self::Json(value) => (Inline { value: Some(value), raw: false }, Vec::new()),
+      Self::Raw(bytes) => (Inline { value: None, raw: true }, bytes),
     }
   }
 }
 
-#[derive(Deserialize)]
-struct EncodingHeader {
-  #[serde(default)]
-  encoding: Encoding,
+impl Inline {
+  pub fn join(self, body: Vec<u8>) -> Result<Payload, ProtocolError> {
+    match (self.raw, self.value) {
+      (true, None) => Ok(Payload::Raw(body)),
+      (false, value) if body.is_empty() => Ok(value.map_or(Payload::None, Payload::Json)),
+      (true, Some(_)) => Err(ProtocolError::Malformed("raw payload with an inline value".into())),
+      (false, _) => Err(ProtocolError::Malformed("frame body without the raw flag".into())),
+    }
+  }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {
-  pub kind: FrameKind,
-  /// Always a JSON object.
-  pub header: Value,
+  pub message: Message,
   pub body: Vec<u8>,
 }
 
 impl Frame {
-  /// `header` must serialize to a JSON object (see [`crate::bridge::header`]); anything else is
-  /// sent as `{}`.
-  pub fn new(kind: FrameKind, header: &impl Serialize) -> Self {
-    let header = match serde_json::to_value(header) {
-      Ok(header @ Value::Object(_)) => header,
-      _ => Value::Object(Map::new()),
-    };
-    Self { kind, header, body: Vec::new() }
+  pub fn new(message: Message) -> Self {
+    Self { message, body: Vec::new() }
   }
 
-  pub fn with_payload(kind: FrameKind, header: &impl Serialize, payload: Payload) -> Self {
-    let mut frame = Self::new(kind, header);
-    frame.header["encoding"] = serde_json::to_value(payload.encoding()).expect("encoding serializes");
-    frame.body = payload.into_body();
-    frame
+  /// `[u32 BE header length][header JSON][body]`, without the outer length prefix.
+  pub fn encode(&self) -> Bytes {
+    let header = serde_json::to_vec(&self.message).expect("messages always serialize");
+    let mut buf = BytesMut::with_capacity(4 + header.len() + self.body.len());
+    buf.put_u32(header.len() as u32);
+    buf.put_slice(&header);
+    buf.put_slice(&self.body);
+    buf.freeze()
   }
 
-  /// Parses the header as `H`; missing or mistyped fields make the frame malformed.
-  pub fn header<H: DeserializeOwned>(&self) -> Result<H, ProtocolError> {
-    H::deserialize(&self.header).map_err(|e| ProtocolError::Malformed(format!("invalid {:?} header: {e}", self.kind)))
-  }
-
-  pub fn into_payload(self) -> Result<Payload, ProtocolError> {
-    let EncodingHeader { encoding } = self.header()?;
-    Payload::from_wire(encoding, self.body)
-  }
-}
-
-fn header_bytes(frame: &Frame) -> Vec<u8> {
-  serde_json::to_vec(&frame.header).expect("a JSON value always serializes")
-}
-
-pub fn encoded_len(frame: &Frame) -> usize {
-  1 + 4 + header_bytes(frame).len() + frame.body.len()
-}
-
-fn parse(buf: &[u8]) -> Result<Frame, ProtocolError> {
-  if buf.len() < 5 {
-    return Err(ProtocolError::Malformed("frame shorter than 5 bytes".into()));
-  }
-  let kind = FrameKind::try_from(buf[0])
-    .map_err(|e| ProtocolError::Malformed(format!("unknown frame kind {:#x}", e.number)))?;
-  let header_len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
-  let end = 5usize
-    .checked_add(header_len)
-    .filter(|end| *end <= buf.len())
-    .ok_or_else(|| ProtocolError::Malformed("header length exceeds frame".into()))?;
-  let header = if header_len == 0 {
-    Value::Object(Map::new())
-  } else {
-    match serde_json::from_slice(&buf[5..end]) {
-      Ok(header @ Value::Object(_)) => header,
-      Ok(_) => return Err(ProtocolError::Malformed("header is not an object".into())),
-      Err(e) => return Err(ProtocolError::Malformed(format!("invalid header: {e}"))),
+  pub fn decode(buf: &[u8]) -> Result<Self, ProtocolError> {
+    let (len, rest) = buf
+      .split_first_chunk::<4>()
+      .ok_or_else(|| ProtocolError::Malformed("frame shorter than 4 bytes".into()))?;
+    let header_len = u32::from_be_bytes(*len) as usize;
+    if header_len > rest.len() {
+      return Err(ProtocolError::Malformed("header length exceeds frame".into()));
     }
-  };
-  Ok(Frame { kind, header, body: buf[end..].to_vec() })
+    let (header, body) = rest.split_at(header_len);
+    let message =
+      serde_json::from_slice(header).map_err(|e| ProtocolError::Malformed(format!("invalid header: {e}")))?;
+    Ok(Self { message, body: body.to_vec() })
+  }
 }
 
-/// Frames on top of [`LengthDelimitedCodec`] (u32 big-endian length prefix, capped at
-/// `max_frame_size`).
+/// u32 big-endian length prefix, capped at `max_frame_size`.
+pub fn length_codec(max_frame_size: usize) -> LengthDelimitedCodec {
+  LengthDelimitedCodec::builder()
+    .big_endian()
+    .length_field_type::<u32>()
+    .max_frame_length(max_frame_size)
+    .new_codec()
+}
+
+/// Decodes frames on top of [`length_codec`].
 ///
-/// Decoding yields `Ok(Err(_))` for a complete but malformed frame (unknown kind, bad header):
-/// the stream is still aligned on a frame boundary and reading can continue. `Err(_)` is fatal,
-/// including [`ProtocolError::TooLarge`] for a length prefix above the limit: both sides check
-/// sizes before sending, so an oversized frame means a broken peer and is not skipped.
+/// Decoding yields `Ok(Err(_))` for a complete but malformed frame (bad JSON, unknown message
+/// type, missing field): the stream is still aligned on a frame boundary and reading can
+/// continue. `Err(_)` is fatal, including [`ProtocolError::TooLarge`] for a length prefix above
+/// the limit: both sides check sizes before sending, so an oversized frame means a broken peer
+/// and is not skipped.
 pub struct FrameCodec {
   inner: LengthDelimitedCodec,
   max_frame_size: usize,
@@ -180,12 +203,7 @@ pub struct FrameCodec {
 
 impl FrameCodec {
   pub fn new(max_frame_size: usize) -> Self {
-    let inner = LengthDelimitedCodec::builder()
-      .big_endian()
-      .length_field_type::<u32>()
-      .max_frame_length(max_frame_size)
-      .new_codec();
-    Self { inner, max_frame_size }
+    Self { inner: length_codec(max_frame_size), max_frame_size }
   }
 }
 
@@ -201,21 +219,7 @@ impl Decoder for FrameCodec {
         ProtocolError::Io(e)
       }
     })?;
-    Ok(chunk.map(|buf| parse(&buf)))
-  }
-}
-
-impl Encoder<Frame> for FrameCodec {
-  type Error = std::io::Error;
-
-  fn encode(&mut self, frame: Frame, dst: &mut BytesMut) -> std::io::Result<()> {
-    let header = header_bytes(&frame);
-    let mut buf = BytesMut::with_capacity(5 + header.len() + frame.body.len());
-    buf.put_u8(frame.kind.into());
-    buf.put_u32(header.len() as u32);
-    buf.put_slice(&header);
-    buf.put_slice(&frame.body);
-    self.inner.encode(buf.freeze(), dst)
+    Ok(chunk.map(|buf| Frame::decode(&buf)))
   }
 }
 
@@ -223,44 +227,112 @@ impl Encoder<Frame> for FrameCodec {
 mod tests {
   use super::*;
   use serde_json::json;
+  use tokio_util::codec::Encoder;
 
-  fn sample() -> Frame {
-    Frame::with_payload(FrameKind::Request, &json!({"id": 1, "cmd": "hello"}), Payload::Raw(vec![0, 255]))
-  }
-
-  fn encode(frame: &Frame) -> Vec<u8> {
+  fn wire(frame: &Frame) -> Vec<u8> {
     let mut buf = BytesMut::new();
-    FrameCodec::new(DEFAULT_MAX_FRAME_SIZE).encode(frame.clone(), &mut buf).unwrap();
+    length_codec(DEFAULT_MAX_FRAME_SIZE).encode(frame.encode(), &mut buf).unwrap();
     buf.to_vec()
   }
 
-  #[test]
-  fn roundtrip() {
-    let frame = sample();
-    let data = encode(&frame);
-    let mut buf = BytesMut::from(&data[..]);
-    let got = FrameCodec::new(DEFAULT_MAX_FRAME_SIZE).decode(&mut buf).unwrap().unwrap().unwrap();
-    assert_eq!(got, frame);
-    assert_eq!(got.header["encoding"], "raw");
-    assert_eq!(encoded_len(&frame), data.len() - 4);
-    assert!(buf.is_empty());
+  fn raw_wire(header: &[u8]) -> Vec<u8> {
+    [&((4 + header.len()) as u32).to_be_bytes()[..], &(header.len() as u32).to_be_bytes(), header].concat()
+  }
+
+  fn decode_all(data: &[u8], max: usize) -> Vec<Result<Frame, ProtocolError>> {
+    let mut codec = FrameCodec::new(max);
+    let mut buf = BytesMut::from(data);
+    std::iter::from_fn(|| codec.decode(&mut buf).unwrap()).collect()
+  }
+
+  fn event(name: &str) -> Frame {
+    Frame::new(Message::Event { event: name.into(), target: None, window: None, payload: Inline::default() })
+  }
+
+  fn raw_response(id: u64, body: &[u8]) -> Frame {
+    let (payload, body) = Payload::Raw(body.to_vec()).split();
+    Frame { message: Message::Response { id, payload }, body }
+  }
+
+  /// Must match `GOLDEN_FRAMES` in python-sdk/tests/test_protocol.py.
+  fn golden_frames() -> Vec<(&'static str, Frame)> {
+    let json = |value: Value| Inline { value: Some(value), raw: false };
+    vec![
+      ("hello", Frame::new(Message::Hello { protocol: 2, sdk: "0.1.0".into(), commands: vec!["greet".into()] })),
+      (
+        "ready",
+        Frame::new(Message::Ready { protocol: 2, app: AppInfo { name: "app".into(), version: "1.0.0".into() } }),
+      ),
+      ("shutdown", Frame::new(Message::Shutdown { timeout_ms: 3000 })),
+      (
+        "request",
+        Frame::new(Message::Request {
+          id: 7,
+          cmd: "greet".into(),
+          channels: [("onItem".into(), 3)].into(),
+          window: Some("main".into()),
+          payload: json(json!({"n": [1, 2.5, null], "name": "中文"})),
+        }),
+      ),
+      ("response_raw", raw_response(7, &[0, 255])),
+      (
+        "error",
+        Frame::new(Message::Error {
+          id: 7,
+          code: Some("custom".into()),
+          message: Some("bad".into()),
+          data: Some(json!({"x": 1})),
+        }),
+      ),
+      ("cancel", Frame::new(Message::Cancel { id: 7, reason: "timeout".into() })),
+      (
+        "event",
+        Frame::new(Message::Event {
+          event: "tick".into(),
+          target: Some("main".into()),
+          window: None,
+          payload: Inline::default(),
+        }),
+      ),
+      ("channel_data", Frame::new(Message::ChannelData { channel: 3, payload: json(json!(1)) })),
+      ("channel_close", Frame::new(Message::ChannelClose { channel: 3 })),
+    ]
   }
 
   #[test]
-  fn layout_matches_python() {
-    let mut frame = Frame::new(FrameKind::Cancel, &json!({"id": 2}));
-    frame.body = b"xy".to_vec();
-    let data = encode(&frame);
-    let header = br#"{"id":2}"#;
-    assert_eq!(&data[..4], &((1 + 4 + header.len() + 2) as u32).to_be_bytes());
-    assert_eq!(data[4], 0x13);
-    assert_eq!(&data[5..9], &(header.len() as u32).to_be_bytes());
-    assert_eq!(&data[9..], [&header[..], b"xy"].concat().as_slice());
+  fn golden_frames_match_python() {
+    let fixture: BTreeMap<String, String> = serde_json::from_str(include_str!(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/python-sdk/tests/fixtures/golden_frames.json"
+    )))
+    .unwrap();
+    let frames = golden_frames();
+    assert_eq!(fixture.keys().collect::<Vec<_>>(), {
+      let mut names: Vec<_> = frames.iter().map(|(name, _)| *name).collect();
+      names.sort();
+      names
+    });
+    for (name, frame) in frames {
+      let hex = &fixture[name];
+      let data: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+      assert_eq!(wire(&frame), data, "{name}: encoding differs");
+      let decoded = decode_all(&data, DEFAULT_MAX_FRAME_SIZE).pop().unwrap().unwrap();
+      assert_eq!(decoded, frame, "{name}: decoding differs");
+    }
+  }
+
+  #[test]
+  fn layout() {
+    let data = wire(&raw_response(2, b"xy"));
+    let header = br#"{"type":"response","id":2,"raw":true}"#;
+    assert_eq!(&data[..4], &((4 + header.len() + 2) as u32).to_be_bytes());
+    assert_eq!(&data[4..8], &(header.len() as u32).to_be_bytes());
+    assert_eq!(&data[8..], [&header[..], b"xy"].concat().as_slice());
   }
 
   #[test]
   fn partial_input_waits_and_truncated_eof_is_fatal() {
-    let data = encode(&sample());
+    let data = wire(&raw_response(1, &[0, 255]));
     let mut codec = FrameCodec::new(DEFAULT_MAX_FRAME_SIZE);
     let mut buf = BytesMut::from(&data[..data.len() - 1]);
     assert!(codec.decode(&mut buf).unwrap().is_none());
@@ -270,8 +342,7 @@ mod tests {
 
   #[test]
   fn oversized_frame_is_fatal() {
-    let big = Frame::with_payload(FrameKind::Event, &json!({"event": "x"}), Payload::Raw(vec![1; 100]));
-    let mut buf = BytesMut::from(&encode(&big)[..]);
+    let mut buf = BytesMut::from(&wire(&raw_response(1, &[1; 100]))[..]);
     let err = FrameCodec::new(64).decode(&mut buf).unwrap_err();
     assert!(matches!(err, ProtocolError::TooLarge(64)), "{err:?}");
     assert_eq!(Error::from(err).code, codes::FRAME_TOO_LARGE);
@@ -279,41 +350,46 @@ mod tests {
 
   #[test]
   fn malformed_frames_are_skipped() {
-    let mut unknown_kind = encode(&Frame::new(FrameKind::Event, &json!({})));
-    unknown_kind[4] = 0x7f;
-    let mut bad_json = encode(&Frame::new(FrameKind::Event, &json!({"event": "x"})));
-    bad_json[9] = b'[';
-    let good = Frame::new(FrameKind::Event, &json!({"event": "ok"}));
-    let mut buf = BytesMut::from(&[unknown_kind, bad_json, encode(&good)].concat()[..]);
-    let mut codec = FrameCodec::new(1024);
-    assert!(matches!(codec.decode(&mut buf).unwrap(), Some(Err(ProtocolError::Malformed(_)))));
-    assert!(matches!(codec.decode(&mut buf).unwrap(), Some(Err(ProtocolError::Malformed(_)))));
-    assert_eq!(codec.decode(&mut buf).unwrap().unwrap().unwrap(), good);
+    let bad: [&[u8]; 6] = [
+      br#"{"type":"bogus"}"#,
+      br#"{"type":"response"}"#,
+      br#"{"type":"response","id":"1"}"#,
+      br#"{"id":1}"#,
+      b"[1]",
+      b"{not json",
+    ];
+    let mut data: Vec<u8> = bad.iter().flat_map(|h| raw_wire(h)).collect();
+    data.extend([0, 0, 0, 4, 0, 0, 0, 9]);
+    data.extend(wire(&event("ok")));
+    let frames = decode_all(&data, 1024);
+    assert_eq!(frames.len(), bad.len() + 2);
+    for frame in &frames[..bad.len() + 1] {
+      assert!(matches!(frame, Err(ProtocolError::Malformed(_))), "{frame:?}");
+    }
+    assert_eq!(frames.last().unwrap().as_ref().unwrap(), &event("ok"));
   }
 
   #[test]
-  fn payload_from_wire() {
-    let payload = |header: Value, body: &[u8]| {
-      let mut frame = Frame::new(FrameKind::Response, &header);
-      frame.body = body.to_vec();
-      frame.into_payload()
-    };
-    assert_eq!(payload(json!({}), b"").unwrap(), Payload::None);
-    assert_eq!(payload(json!({"encoding": "json"}), b"1").unwrap(), Payload::Json("1".into()));
-    assert_eq!(payload(json!({"encoding": "raw"}), &[1]).unwrap(), Payload::Raw(vec![1]));
-    assert!(payload(json!({"encoding": "json"}), &[0xff]).is_err());
-    assert!(payload(json!({"encoding": "yaml"}), b"").is_err());
+  fn payload_roundtrip_and_validation() {
+    for payload in [Payload::None, Payload::Json(json!({"a": [1, null]})), Payload::Raw(vec![1, 2])] {
+      let (inline, body) = payload.clone().split();
+      assert_eq!(inline.join(body).unwrap(), payload);
+    }
+    assert!(Inline { value: Some(json!(1)), raw: false }.join(vec![1]).is_err());
+    assert!(Inline { value: Some(json!(1)), raw: true }.join(vec![1]).is_err());
   }
 
   #[test]
-  fn typed_headers_keep_wire_names() {
-    use crate::bridge::header::{Request, Shutdown};
-    let request = Request { id: 1, cmd: "hi".into(), channels: [("onItem".into(), 2)].into(), window: None };
-    let frame = Frame::with_payload(FrameKind::Request, &request, Payload::None);
-    assert_eq!(frame.header, json!({"id": 1, "cmd": "hi", "channels": {"onItem": 2}, "encoding": "none"}));
-    assert_eq!(frame.header::<Request>().unwrap(), request);
-    let frame = Frame::new(FrameKind::Shutdown, &Shutdown { timeout_ms: 5 });
-    assert_eq!(&encode(&frame)[9..], br#"{"timeoutMs":5}"#);
-    assert!(matches!(Frame::new(FrameKind::Response, &json!({})).header::<Request>(), Err(ProtocolError::Malformed(_))));
+  fn absent_fields_are_omitted() {
+    let frame = Frame::new(Message::Request {
+      id: 1,
+      cmd: "hi".into(),
+      channels: BTreeMap::new(),
+      window: None,
+      payload: Inline::default(),
+    });
+    assert_eq!(&wire(&frame)[8..], br#"{"type":"request","id":1,"cmd":"hi"}"#);
+    let message: Message = serde_json::from_str(r#"{"type":"error","id":1,"extra":true}"#).unwrap();
+    assert_eq!(message, Message::Error { id: 1, code: None, message: None, data: None });
   }
 }

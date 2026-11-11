@@ -11,7 +11,7 @@ from pydantic.alias_generators import to_camel, to_snake
 from tauri_runtime.command import Command, TauriError, bind_arguments, build_handler
 from tauri_runtime import protocol as wire
 from tauri_runtime.protocol import Frame, Raw, Writer, read_frame
-from tauri_runtime.router import Router
+from tauri_runtime.router import CommandTable
 
 
 class FakeApp:
@@ -196,8 +196,8 @@ async def _channel_scenario():
     ]
 
 
-def test_router_rejects_duplicates_and_sorts_names():
-    router = Router()
+def test_command_table_rejects_duplicates_and_sorts_names():
+    router = CommandTable()
     router.add(build_handler("b", lambda: None, FakeApp))
     router.add(build_handler("a", lambda: None, FakeApp))
     assert router.names() == ["a", "b"]

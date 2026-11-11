@@ -38,9 +38,8 @@ from .protocol import (
     split_payload,
     take_over_stdio,
 )
-from .router import Router
+from .router import LIFECYCLE, CommandTable, Router, check_hook
 
-LIFECYCLE = ("startup", "ready", "shutdown")
 RESERVED_EVENTS = ("exited",)
 DEFAULT_SHUTDOWN_TIMEOUT_S = 3.0
 
@@ -138,7 +137,7 @@ class App:
     """
 
     def __init__(self, *, stdio: bool = True, max_workers: int | None = None) -> None:
-        self._router = Router()
+        self._router = CommandTable()
         self._events = EventBus()
         self._hooks: dict[str, list[Callable[..., Any]]] = {name: [] for name in LIFECYCLE}
         self._max_workers = max_workers or min(32, (os.cpu_count() or 1) + 4)
@@ -178,14 +177,71 @@ class App:
                 return "1.0.0"
             ```
         """
+        if callable(name_or_func):
+            self.add_command(name_or_func)
+            return name_or_func
 
-        def register(func: Callable[..., Any], name: str | None) -> Callable[..., Any]:
-            self._router.add(build_handler(name or func.__name__, func, App))
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            self.add_command(func, name_or_func)
             return func
 
-        if callable(name_or_func):
-            return register(name_or_func, None)
-        return lambda func: register(func, name_or_func)
+        return decorator
+
+    def add_command(self, func: Callable[..., Any], name: str | None = None) -> None:
+        """以命令式方式注册命令，等价于 `@app.command` / `@app.command(name)`。
+
+        Args:
+            func: 命令处理器，同步或异步函数。
+            name: 命令名；省略时使用函数名。
+
+        Raises:
+            ValueError: 命令名已注册。
+            TypeError: 处理器签名不受支持（如参数注解无法被 pydantic 处理）。
+        """
+        self._router.add(build_handler(name or func.__name__, func, App))
+
+    def add_commands(self, *funcs: Callable[..., Any]) -> None:
+        """批量注册命令，命令名均取函数名。
+
+        Example:
+            ```python
+            from . import files
+
+            app.add_commands(files.read, files.write, files.remove)
+            ```
+        """
+        for func in funcs:
+            self.add_command(func)
+
+    def add_listener(self, event: str, func: Callable[..., Any]) -> None:
+        """以命令式方式注册事件监听器，等价于 `@app.listen(event)`。"""
+        self._events.add(event, func)
+
+    def add_hook(self, hook: str, func: Callable[..., Any]) -> None:
+        """以命令式方式注册生命周期钩子，等价于 `@app.on(hook)`。
+
+        Raises:
+            ValueError: 未知的钩子名。
+        """
+        check_hook(hook)
+        self._hooks[hook].append(func)
+
+    def include(self, router: Router) -> None:
+        """挂载一个 `Router`，注册其中的全部命令、事件监听器与生命周期钩子。
+
+        命令名已带上 `Router` 的前缀（如 `"user.login"`）；挂载时取 `Router` 当前内容的
+        快照，之后再向其添加的内容不会生效。须在 `run()` / `serve()` 之前调用。
+
+        Raises:
+            ValueError: 命令名与已注册的命令重复。
+            TypeError: 某个处理器签名不受支持。
+        """
+        for name, func in router.commands:
+            self.add_command(func, name)
+        for event, func in router.listeners:
+            self.add_listener(event, func)
+        for hook, func in router.hooks:
+            self.add_hook(hook, func)
 
     def on(self, hook: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """注册生命周期钩子的装饰器。
@@ -202,11 +258,10 @@ class App:
         Raises:
             ValueError: 未知的钩子名。
         """
-        if hook not in self._hooks:
-            raise ValueError(f"unknown lifecycle hook '{hook}', expected one of {LIFECYCLE}")
+        check_hook(hook)
 
         def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-            self._hooks[hook].append(func)
+            self.add_hook(hook, func)
             return func
 
         return decorator
@@ -225,7 +280,7 @@ class App:
         """
 
         def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-            self._events.add(event, func)
+            self.add_listener(event, func)
             return func
 
         return decorator

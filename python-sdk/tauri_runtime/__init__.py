@@ -8,6 +8,7 @@ Python 进程作为 Tauri 应用的 sidecar 运行，通过 stdio 上的长度�
 - `Channel`：从 Python 向前端 `Channel` 推送数据的流。
 - `Event`：前端通过 `pyEmit` 发来的事件。
 - `Raw`：二进制载荷，经帧体传输而非内联 JSON。
+- `Router`：按模块分组注册命令、事件监听与钩子，由 `App.include()` 挂载。
 - `TauriError`：带自定义错误码的结构化错误。
 
 Example:
@@ -29,7 +30,8 @@ from .channel import Channel
 from .command import Command, TauriError
 from .event import Event
 from .protocol import PROTOCOL_VERSION, SDK_VERSION, Raw
+from .router import Router
 
 __version__ = SDK_VERSION
 
-__all__ = ["PROTOCOL_VERSION", "SDK_VERSION", "App", "Channel", "Command", "Event", "Raw", "TauriError"]
+__all__ = ["PROTOCOL_VERSION", "SDK_VERSION", "App", "Channel", "Command", "Event", "Raw", "Router", "TauriError"]

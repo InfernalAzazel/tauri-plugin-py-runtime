@@ -66,6 +66,45 @@ app.run()
 - `print` is safe: stdout is reserved for the protocol, so `sys.stdout` is redirected to
   stderr, and everything written to stderr ends up in the app log (see [Logging](#logging)).
 
+### Organizing larger projects
+
+Every decorator has an imperative counterpart: `app.add_command(func, name=None)`,
+`app.add_commands(*funcs)`, `app.add_listener(event, func)` and `app.add_hook(hook, func)`.
+
+To split a backend into modules without importing the `App` instance everywhere, group
+registrations in a `Router` and mount it once in the entry file:
+
+```python
+# users.py
+from tauri_runtime import Router
+
+router = Router(prefix="user")
+
+@router.command
+async def login(name: str) -> str:  # invoked as pyInvoke("user.login", { name })
+    return f"welcome {name}"
+
+def logout() -> None: ...
+
+router.add_command(logout)  # "user.logout"
+
+@router.listen("app:theme")  # event names are not prefixed
+def on_theme(event): ...
+
+# main.py
+from tauri_runtime import App
+import users
+
+app = App()
+app.include(users.router)
+app.run()
+```
+
+- The prefix is joined with `.`; `router.include(other)` nests routers (`"user.session.login"`).
+- A `Router` supports the same `command`, `listen` and `on` decorators and `add_*` methods.
+- Handler signatures and duplicate names are checked when the router is mounted with
+  `app.include(...)`, which takes a snapshot: anything added to the router afterwards is ignored.
+
 ## Rust
 
 ```rust

@@ -1,10 +1,13 @@
 """`tauri-runtime init` / `create` 的纯函数测试：文件修改（含幂等）、命令拼装与模板。"""
 
 import json
+import subprocess
 import tomllib
 from pathlib import Path
 
-from tauri_runtime import SDK_VERSION
+import pytest
+
+from tauri_runtime import SDK_VERSION, cli
 from tauri_runtime.cli import scaffold, templates
 from tauri_runtime.cli.scaffold import Source
 
@@ -128,3 +131,102 @@ def test_pyproject_toml_per_source():
 
 def test_main_py_template_compiles():
     compile(templates.MAIN_PY, "main.py", "exec")
+
+
+def make_tauri_project(root: Path) -> Path:
+    """最小 create-tauri-app 项目：配置、capability、lib.rs 与 package.json。"""
+    (root / "src-tauri" / "capabilities").mkdir(parents=True)
+    (root / "src-tauri" / "src").mkdir()
+    (root / "src-tauri" / "tauri.conf.json").write_text(TAURI_CONF)
+    (root / "src-tauri" / "capabilities" / "default.json").write_text(json.dumps({"permissions": ["core:default"]}))
+    (root / "src-tauri" / "src" / "lib.rs").write_text(LIB_RS)
+    (root / "package.json").write_text("{}")
+    return root
+
+
+class FakeRun:
+    """记录外部命令（不含程序路径）；`create-tauri-app` 时生成最小项目，可指定失败的程序。"""
+
+    def __init__(self, fail: str | None = None):
+        self.calls: list[tuple[list[str], Path]] = []
+        self.fail = fail
+
+    def __call__(self, cmd, cwd, check):
+        args = [Path(cmd[0]).name, *cmd[1:]]
+        self.calls.append((args, cwd))
+        if "tauri-app" in args:
+            make_tauri_project(cwd / args[args.index("tauri-app") + 1])
+        return subprocess.CompletedProcess(cmd, 1 if args[0] == self.fail else 0)
+
+
+@pytest.fixture(autouse=True)
+def fake_which(monkeypatch):
+    monkeypatch.setattr(scaffold.shutil, "which", lambda name: f"/bin/{name}")
+
+
+def test_init_sets_up_project(tmp_path):
+    project = make_tauri_project(tmp_path)
+    run = FakeRun()
+    assert scaffold.init(project, run=run) == []
+    assert [args for args, _ in run.calls] == [
+        ["uv", "sync"],
+        scaffold.cargo_add_command(Source()),
+        scaffold.frontend_add_command("pnpm", Source()),
+    ]
+    assert run.calls[0][1] == project / "src-python"
+    assert (project / "src-python" / "main.py").read_text() == templates.MAIN_PY
+    assert "tauri_plugin_py_runtime" in (project / "src-tauri" / "src" / "lib.rs").read_text()
+    capability = json.loads((project / "src-tauri" / "capabilities" / "default.json").read_text())
+    assert "py-runtime:default" in capability["permissions"]
+    conf = json.loads((project / "src-tauri" / "tauri.conf.json").read_text())
+    assert scaffold.BUILD_STEP in conf["build"]["beforeBuildCommand"]
+
+
+def test_init_refuses_existing_backend_unless_forced(tmp_path):
+    project = make_tauri_project(tmp_path)
+    (project / "src-python").mkdir()
+    (project / "src-python" / "main.py").write_text("mine")
+    with pytest.raises(scaffold.ScaffoldError, match="--force"):
+        scaffold.init(project, run=FakeRun())
+    scaffold.init(project, force=True, run=FakeRun())
+    assert (project / "src-python" / "main.py").read_text() == "mine"
+    assert (project / "src-python" / "pyproject.toml").is_file()
+
+
+def test_init_hints_when_lib_rs_unrecognized(tmp_path):
+    project = make_tauri_project(tmp_path)
+    (project / "src-tauri" / "src" / "lib.rs").write_text("fn main() {}\n")
+    hints = scaffold.init(project, run=FakeRun())
+    assert len(hints) == 1
+    assert "tauri_plugin_py_runtime::Builder" in hints[0]
+
+
+def test_init_stops_on_failed_command(tmp_path):
+    project = make_tauri_project(tmp_path)
+    run = FakeRun(fail="cargo")
+    with pytest.raises(scaffold.ScaffoldError, match="cargo add"):
+        scaffold.init(project, run=run)
+    assert len(run.calls) == 2
+
+
+def test_init_requires_tauri_project_and_valid_path_source(tmp_path):
+    with pytest.raises(scaffold.ScaffoldError, match="src-tauri"):
+        scaffold.init(tmp_path, run=FakeRun())
+    with pytest.raises(scaffold.ScaffoldError, match="checkout"):
+        scaffold.init(tmp_path, Source("path", tmp_path), run=FakeRun())
+
+
+def test_create_runs_create_tauri_app_then_init(tmp_path):
+    run = FakeRun()
+    project, hints = scaffold.create("demo", manager="bun", source=Source("git"), cwd=tmp_path, run=run)
+    assert project == tmp_path / "demo"
+    assert hints == []
+    assert run.calls[0] == (scaffold.create_command("demo", "vue-ts", "bun"), tmp_path)
+    assert run.calls[-1][0] == ["bun", "add", scaffold.GITHUB_SPEC]
+    with pytest.raises(scaffold.ScaffoldError, match="already exists"):
+        scaffold.create("demo", cwd=tmp_path, run=run)
+
+
+def test_main_init_reports_errors(tmp_path, capsys):
+    assert cli.main(["init", "--project", str(tmp_path)]) == 1
+    assert "src-tauri" in capsys.readouterr().err

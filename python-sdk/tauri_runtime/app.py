@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import logging
+import math
 import os
 import sys
 import threading
@@ -31,6 +33,27 @@ from .protocol import (
 from .router import Router
 
 LIFECYCLE = ("startup", "ready", "shutdown")
+RESERVED_EVENTS = ("exited",)
+DEFAULT_SHUTDOWN_TIMEOUT_S = 3.0
+
+
+def shutdown_budget(header: dict[str, Any]) -> float:
+    """Seconds allowed for shutdown, from a Shutdown frame header; invalid values fall back to 3 s."""
+    value = header.get("timeoutMs")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return DEFAULT_SHUTDOWN_TIMEOUT_S
+    if not math.isfinite(value) or value < 0:
+        return DEFAULT_SHUTDOWN_TIMEOUT_S
+    return value / 1000.0
+
+
+def _exit_code(exc: SystemExit) -> int:
+    if exc.code is None:
+        return 0
+    if isinstance(exc.code, int):
+        return exc.code
+    print(exc.code, file=sys.stderr)
+    return 1
 
 
 class App:
@@ -96,10 +119,31 @@ class App:
         if self._stdio is None:
             raise RuntimeError("App(stdio=False) must be driven with serve()")
         reader, writer = self._stdio
-        code = asyncio.run(self.serve(reader, writer))
-        sys.stderr.flush()
-        writer.flush()
-        os._exit(code)
+        code = 1
+        try:
+            code = self._drive(reader, writer)
+        except SystemExit as e:
+            code = _exit_code(e)
+        except BaseException:
+            traceback.print_exc()
+        finally:
+            logging.shutdown()
+            for stream in (sys.stderr, writer):
+                try:
+                    stream.flush()
+                except Exception:
+                    pass
+            # Skips joining worker threads, so a stuck sync handler cannot block exit.
+            os._exit(code)
+
+    def _drive(self, reader: BinaryIO, writer: BinaryIO) -> int:
+        """Run serve() without asyncio.run's final cancel-and-await of leftover tasks,
+        which would hang on handlers that swallow CancelledError."""
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(self.serve(reader, writer))
+        finally:
+            loop.close()
 
     async def serve(self, reader: BinaryIO, writer: BinaryIO) -> int:
         self._loop = asyncio.get_running_loop()
@@ -107,7 +151,7 @@ class App:
         self._executor = ThreadPoolExecutor(self._max_workers, thread_name_prefix="tauri-runtime")
         self._protocol_error = False
         queue: asyncio.Queue[Frame | None] = asyncio.Queue()
-        shutdown_timeout_s = 3.0
+        budget = DEFAULT_SHUTDOWN_TIMEOUT_S
         try:
             try:
                 await self._run_hooks("startup")
@@ -120,14 +164,15 @@ class App:
             threading.Thread(target=self._read_loop, args=(reader, queue), name="tauri-runtime-reader", daemon=True).start()
             while (frame := await queue.get()) is not None:
                 if frame.kind == Kind.SHUTDOWN:
-                    shutdown_timeout_s = frame.header.get("timeoutMs", 3000) / 1000.0
+                    budget = shutdown_budget(frame.header)
                     break
                 try:
                     self._dispatch(frame)
                 except Exception as e:
                     print(f"[WARN] dropped {frame.kind.name} frame: {e}", file=sys.stderr)
-            await self._stop_tasks()
-            await self._run_hooks_logged("shutdown", timeout=shutdown_timeout_s)
+            deadline = self._loop.time() + budget
+            await self._stop_tasks(budget)
+            await self._run_hooks_logged("shutdown", timeout=max(0.0, deadline - self._loop.time()))
             return 2 if self._protocol_error else 0
         finally:
             self._executor.shutdown(wait=False, cancel_futures=True)
@@ -195,23 +240,34 @@ class App:
             await self._invoke(func)
 
     async def _run_hooks_logged(self, hook: str, timeout: float | None = None) -> None:
-        try:
-            if timeout is not None:
-                await asyncio.wait_for(self._run_hooks(hook), timeout=timeout)
-            else:
+        if timeout is None:
+            try:
                 await self._run_hooks(hook)
-        except asyncio.TimeoutError:
-            print("[WARN] shutdown hooks timed out", file=sys.stderr)
-        except Exception:
-            traceback.print_exc()
+            except Exception:
+                traceback.print_exc()
+            return
+        # asyncio.wait (unlike wait_for) never awaits the cancelled task, so a hook
+        # that swallows CancelledError cannot extend the budget.
+        task = asyncio.ensure_future(self._run_hooks(hook))
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+        if not done:
+            task.cancel()
+            print(f"[WARN] {hook} hooks timed out", file=sys.stderr)
+        elif not task.cancelled() and task.exception() is not None:
+            exc = task.exception()
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
 
-    async def _stop_tasks(self) -> None:
+    async def _stop_tasks(self, timeout: float) -> None:
         for call_id in list(self._calls):
             self._cancel_call(call_id)
         pending = list(self._background)
         for task in pending:
             task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        if not pending:
+            return
+        _, still_running = await asyncio.wait(pending, timeout=timeout)
+        if still_running:
+            print(f"[WARN] {len(still_running)} task(s) ignored cancellation; abandoning them", file=sys.stderr)
 
     # calls --------------------------------------------------------------
 

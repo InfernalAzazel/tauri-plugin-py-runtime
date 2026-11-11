@@ -1,4 +1,3 @@
-import asyncio
 import json
 import os
 import threading
@@ -25,7 +24,7 @@ class Harness:
 
     def _run(self, app):
         try:
-            self.exit_code = asyncio.run(app.serve(self._app_in, self._app_out))
+            self.exit_code = app._drive(self._app_in, self._app_out)
         finally:
             self._app_out.close()
 

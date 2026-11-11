@@ -278,6 +278,71 @@ def test_duplicate_call_id(harness):
     assert json.loads(f2.body) == "Hello ok"
 
 
+def stubborn_app():
+    app = base_app()
+
+    @app.command
+    async def stubborn() -> str:
+        while True:
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                pass
+
+    return app
+
+
+def test_handler_swallowing_cancel_does_not_block_shutdown(harness):
+    h = harness(stubborn_app())
+    h.request(1, "stubborn")
+    h.request(2, "hello", {"name": "x"})
+    h.recv()
+    started = time.monotonic()
+    h.send(Kind.SHUTDOWN, {"timeoutMs": 300})
+    h.thread.join(5)
+    assert not h.thread.is_alive()
+    assert time.monotonic() - started < 2
+    assert h.exit_code == 0
+
+
+def test_stdin_eof_with_stubborn_handler_uses_default_budget(harness):
+    h = harness(stubborn_app())
+    h.request(1, "stubborn")
+    h.request(2, "hello", {"name": "x"})
+    h.recv()
+    started = time.monotonic()
+    h._to_app.close()
+    h.thread.join(8)
+    assert not h.thread.is_alive()
+    assert time.monotonic() - started < 5
+
+
+@pytest.mark.parametrize("timeout_ms", ["soon", -5, None, True, [1]])
+def test_invalid_shutdown_timeout_is_tolerated(harness, timeout_ms):
+    app = base_app()
+    calls = []
+
+    @app.on("shutdown")
+    def on_shutdown():
+        calls.append("shutdown")
+
+    h = harness(app)
+    h.send(Kind.SHUTDOWN, {"timeoutMs": timeout_ms})
+    h.thread.join(5)
+    assert h.exit_code == 0
+    assert calls == ["shutdown"]
+
+
+def test_shutdown_budget_parsing():
+    from tauri_runtime.app import shutdown_budget
+
+    assert shutdown_budget({}) == 3.0
+    assert shutdown_budget({"timeoutMs": 1500}) == 1.5
+    assert shutdown_budget({"timeoutMs": 0}) == 0.0
+    for bad in ("soon", -5, None, True, float("inf"), float("nan")):
+        assert shutdown_budget({"timeoutMs": bad}) == 3.0
+
+
 def test_truncated_frame_exit_code_2(harness):
     from tauri_runtime.protocol import Frame
 

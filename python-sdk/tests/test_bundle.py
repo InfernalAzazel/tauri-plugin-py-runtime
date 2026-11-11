@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from tauri_runtime import cli
+from tauri_runtime.cli import bundle
 
 
 def write_project(tmp_path: Path, tool: str = "") -> Path:
@@ -16,7 +17,7 @@ def write_project(tmp_path: Path, tool: str = "") -> Path:
 
 
 def test_defaults_without_tool_section(tmp_path):
-    assert cli.load_config(write_project(tmp_path)) == cli.BuildConfig()
+    assert bundle.load_config(write_project(tmp_path)) == bundle.BuildConfig()
 
 
 def test_reads_tool_section(tmp_path):
@@ -24,26 +25,26 @@ def test_reads_tool_section(tmp_path):
         tmp_path,
         '[tool.tauri-runtime.build]\nentry = "app.py"\nname = "svc"\noutput = "out"\nnuitka-args = ["--lto=no"]\n',
     )
-    assert cli.load_config(project) == cli.BuildConfig(
+    assert bundle.load_config(project) == bundle.BuildConfig(
         entry="app.py", name="svc", output="out", nuitka_args=("--lto=no",)
     )
 
 
 def test_rejects_unknown_keys_and_bad_name(tmp_path):
-    with pytest.raises(cli.BuildError, match="nam"):
-        cli.load_config(write_project(tmp_path, '[tool.tauri-runtime.build]\nnam = "x"\n'))
-    with pytest.raises(cli.BuildError, match="name"):
-        cli.load_config(write_project(tmp_path, '[tool.tauri-runtime.build]\nname = "a/b"\n'))
+    with pytest.raises(bundle.BuildError, match="nam"):
+        bundle.load_config(write_project(tmp_path, '[tool.tauri-runtime.build]\nnam = "x"\n'))
+    with pytest.raises(bundle.BuildError, match="name"):
+        bundle.load_config(write_project(tmp_path, '[tool.tauri-runtime.build]\nname = "a/b"\n'))
 
 
 def test_executable_name():
-    assert cli.executable_name("svc", "win32") == "svc.exe"
-    assert cli.executable_name("svc", "darwin") == "svc"
+    assert bundle.executable_name("svc", "win32") == "svc.exe"
+    assert bundle.executable_name("svc", "darwin") == "svc"
 
 
 def test_nuitka_command(tmp_path):
-    config = cli.BuildConfig(nuitka_args=("--lto=no",))
-    cmd = cli.nuitka_command(config, tmp_path, ["--jobs=2"])
+    config = bundle.BuildConfig(nuitka_args=("--lto=no",))
+    cmd = bundle.nuitka_command(config, tmp_path, ["--jobs=2"])
     assert cmd[:3] == [sys.executable, "-m", "nuitka"]
     assert "--standalone" in cmd
     assert "--remove-output" in cmd
@@ -61,41 +62,41 @@ def fake_nuitka(returncode: int = 0):
         if returncode == 0:
             dist = out / f"{Path(cmd[-1]).stem}.dist"
             dist.mkdir(parents=True)
-            (dist / cli.executable_name(name)).write_text("bin")
+            (dist / bundle.executable_name(name)).write_text("bin")
         return subprocess.CompletedProcess(cmd, returncode)
 
     return run
 
 
 def test_build_moves_dist_into_output(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "nuitka_available", lambda: True)
+    monkeypatch.setattr(bundle, "nuitka_available", lambda: True)
     project = write_project(tmp_path)
     stale = project / "dist" / "py-backend" / "stale.txt"
     stale.parent.mkdir(parents=True)
     stale.write_text("old")
-    exe = cli.build(project, run=fake_nuitka())
-    assert exe == project / "dist" / "py-backend" / cli.executable_name("py-backend")
+    exe = bundle.build(project, run=fake_nuitka())
+    assert exe == project / "dist" / "py-backend" / bundle.executable_name("py-backend")
     assert exe.read_text() == "bin"
     assert not stale.exists()
 
 
 def test_build_failure_keeps_no_output(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "nuitka_available", lambda: True)
+    monkeypatch.setattr(bundle, "nuitka_available", lambda: True)
     project = write_project(tmp_path)
-    with pytest.raises(cli.BuildError, match="exit code 3"):
-        cli.build(project, run=fake_nuitka(3))
+    with pytest.raises(bundle.BuildError, match="exit code 3"):
+        bundle.build(project, run=fake_nuitka(3))
     assert not (project / "dist" / "py-backend").exists()
 
 
 def test_missing_nuitka_and_entry(tmp_path, monkeypatch):
     project = write_project(tmp_path)
-    monkeypatch.setattr(cli, "nuitka_available", lambda: False)
-    with pytest.raises(cli.BuildError, match="uv add --dev nuitka"):
-        cli.build(project)
-    monkeypatch.setattr(cli, "nuitka_available", lambda: True)
+    monkeypatch.setattr(bundle, "nuitka_available", lambda: False)
+    with pytest.raises(bundle.BuildError, match="uv add --dev nuitka"):
+        bundle.build(project)
+    monkeypatch.setattr(bundle, "nuitka_available", lambda: True)
     (project / "main.py").unlink()
-    with pytest.raises(cli.BuildError, match="main.py"):
-        cli.build(project)
+    with pytest.raises(bundle.BuildError, match="main.py"):
+        bundle.build(project)
 
 
 def test_main_reports_errors(tmp_path, capsys):

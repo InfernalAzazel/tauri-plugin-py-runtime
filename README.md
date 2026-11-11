@@ -1,112 +1,225 @@
 # Tauri Plugin py-runtime
 
-Write your Tauri backend in Python. The Rust plugin runs a Python sidecar and forwards
-calls, events and streams between the frontend and Python.
+**Build Tauri desktop apps with a Python backend.**
 
-| Part | Package |
-| --- | --- |
-| Rust plugin | `tauri-plugin-py-runtime` (plugin name `py-runtime`) |
-| Python SDK | `tauri-runtime` on PyPI, imported as `tauri_runtime` (Python ≥ 3.11, requires `pydantic>=2.9`) |
-| Frontend API | `tauri-plugin-py-runtime-api` |
-
-The Rust side and Python talk over the child process's stdin/stdout using a small
-length-prefixed protocol of JSON messages (protocol version 2, frames up to 64 MiB, see
-[Protocol](#protocol)).
-
-## Getting started
-
-The `tauri-runtime` CLI sets everything up. It needs [uv](https://docs.astral.sh/uv/), Cargo
-and Node.js. Create a new app:
-
-```bash
-uvx --from tauri-runtime tauri-runtime create my-app --template vue-ts --manager pnpm
-```
-
-Or add a Python backend to an existing Tauri project (run in the directory containing `src-tauri`):
-
-```bash
-uvx --from tauri-runtime tauri-runtime init
-```
-
-`create` runs `create-tauri-app` and then `init`. `init`:
-
-- creates `src-python/` (`pyproject.toml` depending on `tauri-runtime` with Nuitka as a dev
-  dependency, a `main.py` with a `greet` command, `.gitignore`) and runs `uv sync`;
-- adds the Rust crate (`cargo add`) and the frontend package (pnpm / yarn / bun / npm, detected
-  from the lockfile or `beforeDevCommand`);
-- registers the plugin after `tauri::Builder::default()` in `src-tauri/src/lib.rs`, adds
-  `py-runtime:default` to `capabilities/default.json`, and wires up
-  [Packaging with Nuitka](#packaging-with-nuitka) in `tauri.conf.json` and `build.rs`.
-
-Steps it can't apply safely (an unusual `lib.rs`, `Tauri.toml`, list-form `bundle.resources`, ...)
-are printed for you to do by hand. Re-running is safe: files already set up are left alone, and
-`--force` continues when `src-python` exists without overwriting its files.
-
-Pass `--git` to install all three packages from GitHub (with pnpm this needs pnpm ≥ 10, which
-must be allowed to build the frontend package from git; `init` passes `--allow-build`), or `--path <checkout>` to use a local
-clone of this repository (build its frontend package first with `pnpm install && pnpm build`).
-
-Then `pnpm tauri dev` runs `src-python/main.py` with `src-python/.venv`, and
-`pnpm tauri build` ships the Nuitka-packaged backend:
-
-```ts
-import { pyInvoke } from "tauri-plugin-py-runtime-api";
-
-const message = await pyInvoke<string>("greet", { name: "Tauri" });
-```
-
-## Python
+py-runtime lets you write the backend of a [Tauri 2](https://tauri.app) application in Python
+while keeping Tauri's small footprint, native webview and security model. Python functions
+become commands your frontend can call with full type information, streaming, cancellation and
+structured errors. When you ship, your backend is compiled into a self-contained executable, so
+end users never need to install Python.
 
 ```python
+# src-python/main.py
 from tauri_runtime import App
 
 app = App()
 
 @app.command
-async def hello(name: str) -> str:
-    return f"Hello {name}"
-
-@app.on("ready")
-async def on_ready():
-    print("Application started")
+async def greet(name: str) -> str:
+    return f"Hello {name}, from Python!"
 
 app.run()
 ```
 
-- `async def` commands run on the event loop; plain `def` commands run in a thread pool.
-- Parameters are filled from the JSON arguments (camelCase keys are mapped to snake_case).
-  Missing required parameters fail with `invalid_args`. Annotated parameters are validated with
-  pydantic (`invalid_args` with the validation errors as `data`).
-- Annotate a parameter with `Raw`, `Channel[T]`, `Command` or `App` to receive those instead
-  of a JSON value:
-  - `Raw` – the raw request body (`data.bytes`) when the frontend passes a `Uint8Array` / `ArrayBuffer`.
-  - `Channel[T]` – a stream to a frontend `Channel` passed under the same name
-    (`onProgress` → `on_progress`). Use `await ch.send(value)` (or `ch.send_sync(value)` from a
-    plain `def` command). A channel is only valid until the command returns.
-  - `Command` – call context: `id`, `cmd`, `window` (label of the calling webview), `cancelled`.
-  - `App` – the app instance.
-- Return any value pydantic can serialize to JSON (including dataclasses and pydantic models).
-  Return `Raw(...)` or `bytes` to send binary data; the frontend receives a `Uint8Array`.
-  `NaN` and `±Infinity` are not valid JSON and are rejected: returning them fails the call
-  with `internal` (sending them on a channel or with `emit` raises `ValueError`).
-- Raise `TauriError(code, message, data)` to return a structured error with your own code.
-  If `data` isn't JSON-serializable, the error is sent without `data` and a `[WARN]` is logged.
-  Any other exception becomes `internal` with `data = {"type": "<ExceptionName>"}`; set
-  `TAURI_RUNTIME_DEBUG=1` in the Python environment to also include the traceback.
-- `@app.command("name")` registers under a different name.
-- Lifecycle hooks: `@app.on("startup")` runs before the handshake (an exception aborts the
-  runtime), `@app.on("ready")` after the Rust side confirmed the handshake,
-  `@app.on("shutdown")` when the app exits (bounded by the shutdown timeout).
-- Events: `@app.listen("name")` receives events sent with `pyEmit` (handler gets an `Event`
-  with `name`, `payload`, `window`). `await app.emit("name", payload, target=None)` sends an
-  event to the frontend; `target` is a webview label, otherwise it is broadcast. The name
-  `exited` is reserved for the runtime's own `py://exited` event; `app.emit("exited", ...)`
-  raises `ValueError`.
+```ts
+// frontend
+import { pyInvoke } from "tauri-plugin-py-runtime-api";
+
+const message = await pyInvoke<string>("greet", { name: "Tauri" });
+```
+
+## Highlights
+
+- **Python-first commands.** Plain `def` and `async def` functions become frontend commands.
+  Arguments are validated with pydantic, and camelCase keys map to snake_case automatically.
+- **Real-time communication.** Stream progress over channels, exchange events in both
+  directions, and send binary data without base64 overhead.
+- **Production-grade reliability.** Every call supports timeouts and cancellation. The runtime
+  is supervised, can restart after a crash, and shuts down gracefully with bounded deadlines.
+- **Zero-dependency distribution.** `tauri-runtime build` packages the backend with Nuitka
+  into a standalone executable that ships inside your app bundle.
+- **One-command setup.** `tauri-runtime create` and `tauri-runtime init` scaffold a project or
+  add Python to an existing one, including dependencies, configuration and permissions.
+- **Scales with your codebase.** Routers with prefixes organize large backends into modules.
+- **Secure by default.** Access goes through Tauri capabilities, and a webview can only cancel
+  its own calls.
+
+## How it works
+
+```mermaid
+flowchart LR
+    FE["Frontend<br/>tauri-plugin-py-runtime-api"] -- "invoke · events · channels" --> RS["Rust plugin<br/>tauri-plugin-py-runtime"]
+    RS -- "framed messages over stdin/stdout" --> PY["Python process<br/>tauri-runtime SDK"]
+    PY -- "responses · events · stream data" --> RS
+    RS --> FE
+```
+
+The Rust plugin starts your Python backend as a child process and supervises it. The two talk
+over stdin/stdout using a compact length-prefixed protocol with JSON headers and optional binary
+bodies, described in [Protocol](#protocol). The frontend never talks to Python directly: every
+call goes through Tauri's IPC and permission system.
+
+| Component | Package | Install |
+| --- | --- | --- |
+| Rust plugin | `tauri-plugin-py-runtime` (plugin name `py-runtime`) | `cargo add tauri-plugin-py-runtime` |
+| Python SDK | `tauri-runtime`, imported as `tauri_runtime` | `uv add tauri-runtime` |
+| Frontend API | `tauri-plugin-py-runtime-api` | `pnpm add tauri-plugin-py-runtime-api` |
+
+## Requirements
+
+| Requirement | Version |
+| --- | --- |
+| Tauri | 2.x |
+| Rust | 1.77.2 or newer |
+| Python | 3.11 or newer (the SDK depends on `pydantic>=2.9`) |
+| [uv](https://docs.astral.sh/uv/) | Recommended. The CLI uses it to manage the backend environment |
+| C compiler | Needed only for packaging: Xcode Command Line Tools on macOS, MSVC or MinGW on Windows, gcc on Linux |
+
+## Quick start
+
+Create a new app with a Python backend:
+
+```bash
+uvx --from tauri-runtime tauri-runtime create my-app --template vue-ts --manager pnpm
+cd my-app
+pnpm tauri dev
+```
+
+To add a Python backend to an existing Tauri project instead, run this in the directory that
+contains `src-tauri`:
+
+```bash
+uvx --from tauri-runtime tauri-runtime init
+```
+
+During development, `pnpm tauri dev` runs `src-python/main.py` with the project's virtual
+environment. `pnpm tauri build` compiles the backend and bundles it into the app.
+
+### What the CLI sets up
+
+`create` runs `create-tauri-app` and then `init`. `init` does the following:
+
+| Area | Change |
+| --- | --- |
+| Python | Creates `src-python/` with `pyproject.toml` (depends on `tauri-runtime`, with Nuitka as a dev dependency), a starter `main.py` and `.gitignore`, then runs `uv sync` |
+| Rust | Adds the crate with `cargo add` and registers the plugin after `tauri::Builder::default()` in `src-tauri/src/lib.rs` |
+| Frontend | Installs the API package with pnpm, yarn, bun or npm. The package manager is detected from the lockfile or `beforeDevCommand` |
+| Permissions | Adds `py-runtime:default` to `capabilities/default.json` |
+| Packaging | Configures `beforeBuildCommand` and `bundle.resources` in `tauri.conf.json`, and `build.rs`, as described in [Distribution](#distribution) |
+
+Re-running the CLI is safe: files that are already set up are left alone. If `src-python`
+already exists, `init` stops; `--force` continues the setup without overwriting your files. If a
+step can't be applied safely, for example an unusual `lib.rs`, `Tauri.toml` or list-form
+`bundle.resources`, the CLI prints exact instructions to apply it by hand.
+
+**Package sources.** By default the CLI installs released packages from crates.io, npm and
+PyPI. There are two alternatives:
+
+- `--git` installs all three packages from the GitHub repository. With pnpm this requires pnpm
+  10 or newer; the CLI passes `--allow-build` so that pnpm can build the frontend package from
+  git.
+- `--path <checkout>` uses a local clone of this repository. Build its frontend package first
+  with `pnpm install && pnpm build`.
+
+## Guide
+
+### Writing commands
+
+```python
+from tauri_runtime import App, Channel, Command, Raw, TauriError
+
+app = App()
+
+@app.command
+async def search(query: str, limit: int = 20) -> list[str]:
+    ...
+
+@app.command
+def checksum(data: Raw) -> str:          # receives a Uint8Array / ArrayBuffer from the frontend
+    ...
+
+@app.command
+async def export(rows: int, on_progress: Channel[int]) -> str:
+    for i in range(rows):
+        await on_progress.send(i)
+    return "done"
+
+@app.command("files.remove")             # register under a custom name
+async def remove(path: str, ctx: Command) -> None:
+    if not path:
+        raise TauriError("bad_path", "path is empty", {"path": path})
+
+app.run()
+```
+
+**Execution model**
+
+- `async def` commands run on the event loop. Plain `def` commands run in a thread pool.
 - Cancelling a call cancels the asyncio task of an `async def` command. A plain `def` command
-  keeps running in its worker thread until it returns (Python can't interrupt threads); its
-  result is discarded.
-- `print` is safe: stdout is reserved for the protocol, so `sys.stdout` is redirected to
-  stderr, and everything written to stderr ends up in the app log (see [Logging](#logging)).
+  keeps running in its worker thread until it returns, because Python can't interrupt threads,
+  and its result is discarded.
+
+**Arguments**
+
+- Parameters are filled from the JSON arguments, with camelCase keys mapped to snake_case.
+- A missing required parameter fails with `invalid_args`.
+- Annotated parameters are validated with pydantic. A validation failure fails with
+  `invalid_args`, and the validation errors are sent as `data`.
+
+**Special parameter types.** Annotate a parameter with one of these types to receive the value
+described instead of a JSON value:
+
+| Annotation | Receives |
+| --- | --- |
+| `Raw` | The raw request body (`data.bytes`) when the frontend passes a `Uint8Array` or `ArrayBuffer` |
+| `Channel[T]` | A stream to the frontend `Channel` passed under the same name (`onProgress` → `on_progress`). Send with `await ch.send(value)`, or `ch.send_sync(value)` from a plain `def` command. The channel is valid only until the command returns |
+| `Command` | The call context: `id`, `cmd`, `window` (label of the calling webview) and `cancelled` |
+| `App` | The app instance |
+
+**Return values**
+
+- Return any value pydantic can serialize to JSON, including dataclasses and pydantic models.
+- Return `Raw(...)` or `bytes` to send binary data. The frontend receives a `Uint8Array`.
+- `NaN` and `±Infinity` are not valid JSON and are rejected. Returning them fails the call with
+  `internal`; sending them on a channel or with `emit` raises `ValueError`.
+
+**Errors**
+
+- Raise `TauriError(code, message, data)` to return a structured error with your own code.
+- If `data` isn't JSON-serializable, the error is sent without `data` and a `[WARN]` is logged.
+- Any other exception becomes `internal` with `data = {"type": "<ExceptionName>"}`. Set
+  `TAURI_RUNTIME_DEBUG=1` in the Python environment to also include the traceback.
+
+### Events and lifecycle hooks
+
+```python
+from tauri_runtime import Event
+
+@app.listen("user:login")                # receives pyEmit("user:login", ...) from the frontend
+async def on_login(event: Event):
+    await app.emit("welcome", {"name": event.payload["name"]}, target=event.window)
+
+@app.on("ready")
+async def on_ready():
+    print("Application started")
+```
+
+- A listener receives an `Event` with `name`, `payload` and `window`.
+- `await app.emit(name, payload, target=None)` sends an event to the frontend. `target` is a
+  webview label; without one the event is broadcast to all webviews.
+- The name `exited` is reserved for the runtime's own `py://exited` event, so
+  `app.emit("exited", ...)` raises `ValueError`.
+
+There are three lifecycle hooks:
+
+| Hook | When it runs |
+| --- | --- |
+| `startup` | Before the handshake. An exception aborts the runtime |
+| `ready` | After the Rust side has confirmed the handshake |
+| `shutdown` | When the app exits, within the shutdown timeout |
+
+`print` is safe to use: stdout is reserved for the protocol, so `sys.stdout` is redirected to
+stderr, and stderr is forwarded to the app log (see [Logging](#logging)).
 
 ### Organizing larger projects
 
@@ -132,7 +245,9 @@ router.add_command(logout)  # "user.logout"
 
 @router.listen("app:theme")  # event names are not prefixed
 def on_theme(event): ...
+```
 
+```python
 # main.py
 from tauri_runtime import App
 import users
@@ -142,43 +257,132 @@ app.include(users.router)
 app.run()
 ```
 
-- The prefix is joined with `.`; `router.include(other)` nests routers (`"user.session.login"`).
-- A `Router` supports the same `command`, `listen` and `on` decorators and `add_*` methods.
-- Handler signatures and duplicate names are checked when the router is mounted with
-  `app.include(...)`, which takes a snapshot: anything added to the router afterwards is ignored.
+- The prefix is joined with `.`. `router.include(other)` nests routers, which gives names such as
+  `"user.session.login"`.
+- A `Router` supports the same `command`, `listen` and `on` decorators and the same `add_*`
+  methods as `App`.
+- `app.include(...)` checks handler signatures and duplicate names when it mounts the router,
+  and it takes a snapshot: anything added to the router afterwards is ignored.
 
-## Rust
+### Calling Python from the frontend
+
+```ts
+import { Channel, pyEmit, pyInvoke, pyListen, pyStatus, PyRuntimeError } from "tauri-plugin-py-runtime-api";
+
+const results = await pyInvoke<string[]>("search", { query: "tauri" }, { timeoutMs: 5000 });
+
+const onProgress = new Channel<number>();
+onProgress.onmessage = (n) => console.log(n);
+await pyInvoke("export", { rows: 100, onProgress });
+
+const unlisten = await pyListen("welcome", (e) => console.log(e.payload));
+await pyEmit("user:login", { name: "Kylin" });
+
+console.log(await pyStatus()); // "starting" | "running" | "crashed" | "stopped" | "failed"
+```
+
+#### `pyInvoke(cmd, args?, options?)`
+
+**Arguments**
+
+- `args` is either a plain object, which is sent as JSON, or a `Uint8Array` / `ArrayBuffer`,
+  which is sent as raw bytes and received by a `Raw` parameter.
+- `Channel` values are detected only at the **top level** of `args`. A channel nested inside an
+  object or array is serialized as a plain value and is not connected to Python.
+- Binary results come back as a `Uint8Array`.
+
+**Timeouts**
+
+- `options.timeoutMs` overrides the default invoke timeout for this call. It must be a
+  non-negative integer; otherwise `pyInvoke` throws `invalid_args`.
+- The value is capped at 10× the configured `invoke_timeout`, which is 5 minutes with the
+  default of 30 seconds.
+- On timeout the call rejects with `timeout`, and Python receives a cancel for it.
+
+**Cancellation**
+
+- `options.signal` takes an `AbortSignal`. On abort the promise rejects with `cancelled`
+  immediately, without waiting for the backend, and a cancel is forwarded to Python.
+- An already-aborted signal rejects before anything is sent.
+
+**Call ids.** Each call carries a client call id that is scoped to the calling window:
+
+- A webview can cancel only its own calls.
+- A second call that reuses an id still pending in the same window is rejected with
+  `invalid_args`.
+- `pyInvoke` generates unique ids for you.
+
+#### Channels
+
+- Values sent with `ch.send(...)` arrive in `onmessage` in order.
+- Raw bytes (`Raw` / `bytes`) arrive as an `ArrayBuffer`, not a `Uint8Array`, so declare the
+  channel as `Channel<ArrayBuffer>`.
+- Channel messages and the call result travel separately, so the last `onmessage` can run
+  **after** `pyInvoke` has resolved. If you need strict ordering, send an explicit end marker
+  on the channel (for example `{ done: true }`) and wait for it instead of relying on the
+  promise.
+
+#### Events
+
+- `pyListen(event, handler)` listens to `py://<event>`. Python's `app.emit("x", ...)` arrives
+  as `py://x`. `pyListen` returns an unlisten function.
+- `pyListen("exited", ...)` (`py://exited`) fires whenever the Python process exits
+  unexpectedly. Its payload is `{ code: number | null }`.
+- `pyEmit(event, payload)` sends an event to Python's `@app.listen(event)` handlers. The Python
+  `Event.window` is the label of the sending webview. If Python isn't running, `pyEmit` fails
+  with `runtime_unavailable`.
+- Event payloads are JSON. If Python emits raw bytes as an event, the frontend receives them as
+  an array of numbers; use a channel or a `pyInvoke` result for binary data.
+
+#### Error handling
+
+Every failure rejects with a `PyRuntimeError` (`name`, `code`, `message`, optional `data`). It
+mirrors the `{ code, message, data? }` error shape used across Rust and Python:
+
+```ts
+try {
+  await pyInvoke("files.remove", { path: "" });
+} catch (e) {
+  if (e instanceof PyRuntimeError) console.log(e.code, e.message, e.data);
+}
+```
+
+See [Error codes](#error-codes) for the full list.
+
+### Configuring the Rust plugin
 
 ```rust
 tauri::Builder::default()
     .plugin(
         tauri_plugin_py_runtime::Builder::new()
             .script("../src-python/main.py")
+            .bundle("py-backend")
             .build(),
     )
 ```
 
-`Builder` options:
-
-| Method | Default | Notes |
+| Method | Default | Description |
 | --- | --- | --- |
-| `script(path)` | – (required unless a bundle is used) | Python entry script, see [Script path resolution](#script-path-resolution) |
-| `python(program)` | `<script dir>/.venv` if present, else `python3` (`python` on Windows) | Interpreter to run |
-| `bundle(name)` | none | Release builds run the Nuitka-packaged backend instead, see [Packaging with Nuitka](#packaging-with-nuitka) |
-| `args(iter)` | none | Extra arguments passed after the script path (or to the packaged executable) |
-| `env(key, value)` | none | Extra environment variable for the Python process; call repeatedly |
-| `invoke_timeout(Duration)` | 30 s | Default timeout per call; a per-call `timeoutMs` is capped at 10× this value |
-| `shutdown_timeout(Duration)` | 3 s | Time Python gets to run shutdown hooks |
-| `handshake_timeout(Duration)` | 10 s | Time Python gets to start and send its handshake; also how long a call waits for a runtime that is still starting |
-| `restart_on_crash(bool)` | `false` | See [Process lifecycle](#process-lifecycle) |
+| `script(path)` | Required unless a bundle is used | Python entry script, see [Script path resolution](#script-path-resolution) |
+| `python(program)` | `<script dir>/.venv` if present, otherwise `python3` (`python` on Windows) | Interpreter to run |
+| `bundle(name)` | None | In release builds, run the Nuitka-packaged backend instead, see [Distribution](#distribution) |
+| `args(iter)` | None | Extra arguments passed after the script path, or to the packaged executable |
+| `env(key, value)` | None | Extra environment variable for the Python process. Call repeatedly to set several |
+| `invoke_timeout(Duration)` | 30 s | Default timeout per call. A per-call `timeoutMs` is capped at 10× this value |
+| `shutdown_timeout(Duration)` | 3 s | Time Python gets to run its shutdown hooks |
+| `handshake_timeout(Duration)` | 10 s | Time Python gets to start and send its handshake. Calls made while the runtime is starting wait this long too |
+| `restart_on_crash(bool)` | `false` | Restart the process after a crash, see [Process lifecycle](#process-lifecycle) |
 
 The Python process always gets `PYTHONUNBUFFERED=1` and `PYTHONIOENCODING=utf-8`.
 
-### `tauri.conf.json`
+From Rust code you can reach the runtime with `app.py_runtime().supervisor()` (via
+`PyRuntimeExt`), for example to call commands or read the status.
 
-The same settings (except `env` and `handshake_timeout`, which are `Builder`-only) can be set
-in `plugins.py-runtime`. Keys are camelCase and unknown keys are rejected, so a typo fails at
-startup instead of being ignored:
+#### Configuration file
+
+The same settings can be set in `plugins.py-runtime` in `tauri.conf.json`, except `env` and
+`handshake_timeout`, which are available only on the `Builder`. Keys are camelCase, and unknown
+keys are rejected so that a typo fails at startup instead of being silently ignored:
 
 ```json
 {
@@ -196,53 +400,54 @@ startup instead of being ignored:
 }
 ```
 
-Values set on the `Builder` take precedence over the config file. To configure the plugin
-only through the file, use `tauri_plugin_py_runtime::init()`.
+Values set on the `Builder` take precedence over the configuration file. To configure the plugin
+only through the file, register it with `tauri_plugin_py_runtime::init()`.
 
-From Rust code you can reach the runtime via `app.py_runtime().supervisor()`
-(`PyRuntimeExt`), e.g. to call commands or read the status.
-
-### Permissions
+#### Permissions
 
 Add `"py-runtime:default"` to your capability. It allows `invoke`, `cancel`, `emit` and
-`status`; the individual permissions are `py-runtime:allow-<name>`.
+`status`; the individual permissions are named `py-runtime:allow-<name>`.
 
-### Script path resolution
+#### Script path resolution
 
 - An absolute path is used as is.
-- A relative path is tried against these locations, first existing file wins:
+- A relative path is tried against the following locations, and the first existing file wins:
   1. Debug builds only: the process working directory. Under `tauri dev` that is `src-tauri`,
      so `"../src-python/main.py"` points at `<project>/src-python/main.py`.
-  2. The app's resource directory, with every `..` component replaced by `_up_` (the same
-     layout Tauri's bundler uses for `bundle.resources`).
-- Release builds only look in the resource directory, so the script has to be shipped via
-  `bundle.resources`:
-  - list form: `"resources": ["../src-python/**/*"]` together with `script: "../src-python/main.py"`;
-  - map form: `"resources": { "../src-python/": "src-python/" }` together with `script: "src-python/main.py"`.
-- If nothing is found, plugin setup fails with an error listing every path that was tried.
+  2. The app's resource directory, with every `..` component replaced by `_up_`. This is the
+     same layout Tauri's bundler uses for `bundle.resources`.
+- Release builds look only in the resource directory, so a script that runs in release builds
+  has to be shipped via `bundle.resources`, in one of two forms:
+  - List form: `"resources": ["../src-python/**/*"]` together with
+    `script: "../src-python/main.py"`.
+  - Map form: `"resources": { "../src-python/": "src-python/" }` together with
+    `script: "src-python/main.py"`.
+- If nothing is found, plugin setup fails with an error that lists every path it tried.
 - Python runs with the script's directory as its working directory.
 
-> In script mode the interpreter must have `tauri-runtime` (and therefore `pydantic`)
-> importable. Without an explicit `python`, the plugin uses the virtual environment next to the
-> script (`.venv/bin/python`, `.venv\Scripts\python.exe` on Windows), so a `uv sync` in
-> `src-python` is all that's needed for `tauri dev`. Release builds run the Nuitka-packaged
-> backend instead, so end users don't need Python installed.
+In script mode the interpreter must be able to import `tauri-runtime` (and therefore
+`pydantic`). Without an explicit `python`, the plugin uses the virtual environment next to the
+script (`.venv/bin/python`, or `.venv\Scripts\python.exe` on Windows), so running `uv sync` in
+`src-python` is all `tauri dev` needs.
 
-### Packaging with Nuitka
+## Distribution
 
 `tauri-runtime build` compiles the Python backend with [Nuitka](https://nuitka.net) in
-standalone mode: a folder with an executable, the Python runtime and all dependencies, so the
-user's machine needs no Python. Debug builds keep running the script; release builds with
-`bundle` set run the packaged executable.
+standalone mode. The result is a folder containing an executable, the Python runtime and all
+dependencies, so your users don't need Python installed. Debug builds keep running the script
+for fast iteration; release builds with `bundle` set run the packaged executable.
 
-1. Add Nuitka to your Python project (a C compiler is required: Xcode Command Line Tools on
-   macOS, MSVC or MinGW on Windows, gcc on Linux):
+Projects created with `tauri-runtime create` or `init` are already configured. To set up
+packaging by hand:
+
+1. **Add Nuitka** to the Python project:
 
    ```bash
    cd src-python && uv add --dev nuitka
    ```
 
-2. Optionally configure the build in `src-python/pyproject.toml` (defaults shown):
+2. **Configure the build** in `src-python/pyproject.toml`. This step is optional; the values
+   below are the defaults:
 
    ```toml
    [tool.tauri-runtime.build]
@@ -253,11 +458,11 @@ user's machine needs no Python. Debug builds keep running the script; release bu
    ```
 
    `uv run tauri-runtime build` produces `dist/py-backend/py-backend` (`py-backend.exe` on
-   Windows). Arguments after `--` are passed to Nuitka as well. The build happens in a temporary
-   directory and only replaces the previous output on success.
+   Windows). Arguments after `--` are passed to Nuitka. The build runs in a temporary directory
+   and replaces the previous output only if it succeeds.
 
-3. Build it before the app and ship it as a resource in `tauri.conf.json` (`beforeBuildCommand`
-   runs in the directory containing `src-tauri`):
+3. **Build before the app and bundle the output** as a resource in `tauri.conf.json`.
+   `beforeBuildCommand` runs in the directory that contains `src-tauri`:
 
    ```json
    {
@@ -271,7 +476,7 @@ user's machine needs no Python. Debug builds keep running the script; release bu
    ```
 
    tauri-build checks that resource paths exist even for `tauri dev`, so create the folder in
-   `src-tauri/build.rs` before it is first built:
+   `src-tauri/build.rs` before the backend is first packaged:
 
    ```rust
    fn main() {
@@ -280,7 +485,7 @@ user's machine needs no Python. Debug builds keep running the script; release bu
    }
    ```
 
-4. Tell the plugin the bundle name:
+4. **Point the plugin at the bundle:**
 
    ```rust
    tauri_plugin_py_runtime::Builder::new()
@@ -289,124 +494,88 @@ user's machine needs no Python. Debug builds keep running the script; release bu
        .build()
    ```
 
-Notes:
+**Notes**
 
-- The debug/release switch follows `debug_assertions`, so `tauri build --debug` still runs the
-  script.
-- In release builds `python` and `script` are ignored when `bundle` is set; if the executable
+- The switch between script and bundle follows `debug_assertions`, so `tauri build --debug`
+  still runs the script.
+- In release builds, `python` and `script` are ignored when `bundle` is set. If the executable
   isn't found, plugin setup fails with the path it looked for.
-- Nuitka follows imports; modules imported dynamically and data files need extra
-  `nuitka-args` (`--include-module`, `--include-package-data`, `--include-data-dir`, ...).
-- The first build takes a few minutes; Nuitka caches compiled C files (ccache) for later builds.
-- Verified on macOS (arm64). Windows and Linux use the same layout (`.exe` suffix on Windows) but
-  haven't been tested yet. Code signing and notarization of the packaged folder are not handled.
+- Nuitka follows imports. Modules that are imported dynamically, and data files, need extra
+  `nuitka-args` such as `--include-module`, `--include-package-data` or `--include-data-dir`.
+- The first build takes a few minutes. Nuitka caches compiled C files (ccache), so later builds
+  are faster.
 
-## Frontend
+## Reference
 
-```ts
-import { Channel, pyEmit, pyInvoke, pyListen, pyStatus, PyRuntimeError } from "tauri-plugin-py-runtime-api";
-
-const msg = await pyInvoke<string>("hello", { name: "Kylin" });
-
-const onItem = new Channel<number>();
-onItem.onmessage = (n) => console.log(n);
-await pyInvoke("stream", { count: 10, onItem });
-
-await pyListen("welcome", (e) => console.log(e.payload));
-await pyEmit("user:login", { name: "Kylin" });
-
-console.log(await pyStatus()); // "starting" | "running" | "crashed" | "stopped" | "failed"
-```
-
-### `pyInvoke(cmd, args?, options?)`
-
-- `args` is a plain object (sent as JSON) or a `Uint8Array` / `ArrayBuffer` (sent as raw
-  bytes, received by a `Raw` parameter). Binary results come back as a `Uint8Array`.
-- `Channel` values are only detected at the **top level** of `args`. A channel nested inside
-  an object or array is serialized as a plain value and is not wired up in Python.
-- `options.timeoutMs` overrides the default invoke timeout for this call. It must be a
-  non-negative integer (otherwise `pyInvoke` throws `invalid_args`) and is capped at 10× the
-  configured `invoke_timeout` (5 min with the 30 s default). On timeout the call rejects with
-  `timeout` and Python receives a cancel for it.
-- `options.signal` (an `AbortSignal`) cancels the call: the promise rejects with `cancelled`
-  immediately on abort, without waiting for the backend, and a cancel is forwarded to Python.
-  An already-aborted signal rejects before anything is sent.
-- Each call carries a client call id that is scoped to the calling window: a webview can only
-  cancel its own calls, and a second call reusing an id that is still pending in the same
-  window is rejected with `invalid_args`. `pyInvoke` generates unique ids for you.
-
-### Channels
-
-- Values sent with `ch.send(...)` arrive in `onmessage` in order. Raw bytes (`Raw` / `bytes`)
-  arrive as an `ArrayBuffer`, not a `Uint8Array`; declare the channel as `Channel<ArrayBuffer>`.
-- Channel messages and the call result travel separately, so the last `onmessage` can run
-  **after** `pyInvoke` has resolved. If you need strict ordering, send an explicit end marker
-  on the channel (e.g. `{ done: true }`) and wait for it instead of relying on the promise.
-
-### Events
-
-- `pyListen(event, handler)` listens to `py://<event>`; Python's `app.emit("x", ...)` arrives
-  as `py://x`. `pyListen` returns an unlisten function.
-- `pyListen("exited", ...)` (`py://exited`) fires whenever the Python process exits
-  unexpectedly, with payload `{ code: number | null }`.
-- `pyEmit(event, payload)` sends an event to Python's `@app.listen(event)` handlers; the
-  Python `Event.window` is the label of the sending webview. Fails with `runtime_unavailable`
-  if Python isn't running.
-- Event payloads are JSON. If Python emits raw bytes as an event, the frontend receives them as
-  an array of numbers. Use a channel or a `pyInvoke` result for binary data.
-
-### Errors
-
-Every failure rejects with a `PyRuntimeError` (`name`, `code`, `message`, optional `data`),
-mirroring the error shape `{ code, message, data? }` used across Rust and Python:
-
-```ts
-try {
-  await pyInvoke("fail", { message: "boom" });
-} catch (e) {
-  if (e instanceof PyRuntimeError) console.log(e.code, e.message, e.data);
-}
-```
+### Error codes
 
 | Code | Meaning |
 | --- | --- |
 | `command_not_found` | No Python command with that name |
-| `invalid_args` | Bad arguments (missing parameter, pydantic validation, malformed request) |
+| `invalid_args` | Bad arguments: a missing parameter, pydantic validation failure or malformed request |
 | `internal` | Unhandled Python exception or internal error |
 | `cancelled` | The call was cancelled |
 | `timeout` | The call exceeded its timeout |
-| `runtime_unavailable` | Python isn't running (failed to start, handshake failed or timed out, stopped) |
+| `runtime_unavailable` | Python isn't running: it failed to start, its handshake failed or timed out, or it was stopped |
 | `runtime_exited` | Python exited while the call was in flight |
 | `protocol_mismatch` | The Python SDK speaks a different protocol version |
 | `frame_too_large` | A message exceeded the 64 MiB frame limit |
 
 Codes raised with `TauriError` in Python are passed through unchanged.
 
-## Process lifecycle
+### Process lifecycle
 
-- The Python process starts during plugin setup. Python sends a handshake listing its
-  commands; Rust checks the protocol version and replies, after which `ready` hooks run and the
-  status becomes `running`. Calls made while starting wait for the handshake.
+**Startup**
+
+- The Python process starts during plugin setup.
+- Python sends a handshake that lists its commands. Rust checks the protocol version and
+  replies; then `ready` hooks run and the status becomes `running`.
+- Calls made while the runtime is starting wait for the handshake.
+
+**Crashes and restarts**
+
 - If Python exits unexpectedly, in-flight calls fail with `runtime_exited`, `py://exited` is
   emitted and the status becomes `crashed`.
-- With `restart_on_crash` / `restartOnCrash` enabled (off by default), the process is restarted
-  with exponential backoff: 1 s, 2 s, 4 s … capped at 30 s. The backoff resets once a process
-  stayed up for at least 30 s. If a restarted process fails its handshake, restarting stops and
-  the status becomes `failed`.
-- On app exit, Rust sends a `shutdown` message with `timeoutMs` (the shutdown timeout). Python
-  cancels running calls and runs `shutdown` hooks, all within that one budget (an invalid
-  `timeoutMs` or a closed stdin falls back to 3 s), then exits. Handlers that ignore
-  cancellation and stuck `def` handlers are abandoned rather than awaited. If the process is
-  still alive after the shutdown timeout plus 1 s of grace, it is killed.
-- `app.run()` always ends the process: if an exception escapes (including `sys.exit()` or
-  `KeyboardInterrupt` raised from a handler) it flushes output and exits with the
-  `sys.exit` code, or 1 for any other exception.
+- With `restart_on_crash` / `restartOnCrash` enabled (it is off by default), the process is
+  restarted with exponential backoff: 1 s, 2 s, 4 s and so on, capped at 30 s.
+- The backoff resets once a process has stayed up for at least 30 s.
+- If a restarted process fails its handshake, restarting stops and the status becomes
+  `failed`.
 
-## Protocol
+**Shutdown**
 
-Every frame is `[u32 BE length][u32 BE header length][header JSON][body]`; the outer length
-counts everything after itself and is capped at 64 MiB. The header is one JSON object tagged by
-`type`:
+- On app exit, Rust sends a `shutdown` message with `timeoutMs`, set to the shutdown timeout.
+- Python cancels running calls and runs `shutdown` hooks, all within that one time budget. An
+  invalid `timeoutMs`, or a closed stdin, falls back to 3 s. Python then exits.
+- Handlers that ignore cancellation, and stuck `def` handlers, are abandoned rather than awaited.
+- If the process is still alive after the shutdown timeout plus 1 s of grace, it is killed.
+
+**`app.run()` always ends the process.** If an exception escapes, including `sys.exit()` or
+`KeyboardInterrupt` raised from a handler, it flushes output and exits with the `sys.exit` code,
+or with 1 for any other exception.
+
+### Logging
+
+Python's stderr, including `print` output (which is redirected there), is forwarded line by line
+to the Rust `log` crate under target `py-runtime`. A leading `[DEBUG]`, `[INFO]`, `[WARN]` or
+`[ERROR]` selects the level and is stripped; other lines are logged at `INFO`:
+
+```python
+print("[WARN] disk almost full")   # -> WARN  py-runtime: disk almost full
+```
+
+Install a logger such as `tauri-plugin-log` to see the output.
+
+### Protocol
+
+Rust and Python exchange frames over the child process's stdin/stdout. The current protocol
+version is 2.
+
+**Frame layout**
+
+- Every frame is `[u32 BE length][u32 BE header length][header JSON][body]`.
+- The outer length counts everything after itself and is capped at 64 MiB.
+- The header is one JSON object tagged by `type`:
 
 | `type` | Direction | Fields |
 | --- | --- | --- |
@@ -417,61 +586,69 @@ counts everything after itself and is capped at 64 MiB. The header is one JSON o
 | `response` | Python → Rust | `id`, payload |
 | `error` | Python → Rust | `id`, `code`, `message`, `data?` |
 | `cancel` | Rust → Python | `id`, `reason` (`"client"` or `"timeout"`) |
-| `event` | both | `event`, `target?` (Python → Rust), `window?` (Rust → Python), payload |
+| `event` | Both | `event`, `target?` (Python → Rust), `window?` (Rust → Python), payload |
 | `channel_data` | Python → Rust | `channel`, payload |
 | `channel_close` | Python → Rust | `channel` |
 
-A payload is either a JSON value inline in the header as `value` (absent means none/`null`), or
-binary data in the frame body with `"raw": true`. The body must be empty unless `raw` is set.
-`NaN` and `±Infinity` are never sent. Unknown header fields are ignored. A frame whose header
-can't be decoded (invalid JSON, unknown `type`, missing or mistyped field) is logged and
-skipped; an oversized frame ends the connection. If the first frame from Python isn't a
-decodable `hello` with the same protocol version, startup fails with `protocol_mismatch`.
+**Payloads**
 
-The message types are a serde enum on the Rust side (`bridge::protocol::Message`) and pydantic
-models on the Python side (`tauri_runtime.protocol`). `python-sdk/tests/fixtures/golden_frames.json`
-holds one encoded frame per type that both test suites encode and decode byte for byte.
+- A payload is either a JSON value inline in the header as `value` (an absent `value` means
+  none, or `null`), or binary data in the frame body with `"raw": true`.
+- The body must be empty unless `raw` is set.
+- `NaN` and `±Infinity` are never sent.
 
-## Logging
+**Error handling**
 
-Python's stderr (including `print`, which is redirected there) is forwarded line by line to the
-Rust `log` crate under target `py-runtime`. A leading `[DEBUG]`, `[INFO]`, `[WARN]` or
-`[ERROR]` selects the level and is stripped; other lines are logged at `INFO`:
+- Unknown header fields are ignored.
+- A frame whose header can't be decoded is logged and skipped. That covers invalid JSON, an
+  unknown `type`, and a missing or mistyped field.
+- An oversized frame ends the connection.
+- If the first frame from Python isn't a decodable `hello` with the same protocol version,
+  startup fails with `protocol_mismatch`.
 
-```python
-print("[WARN] disk almost full")   # -> WARN  py-runtime: disk almost full
-```
+**Implementation.** The message types are a serde enum on the Rust side
+(`bridge::protocol::Message`) and pydantic models on the Python side (`tauri_runtime.protocol`).
+`python-sdk/tests/fixtures/golden_frames.json` holds one encoded frame per message type, and
+both test suites encode and decode them byte for byte.
 
-Install a logger (e.g. `tauri-plugin-log`) to see the output.
+## Platform support
+
+| Platform | Development (`tauri dev`) | Packaged backend |
+| --- | --- | --- |
+| macOS (Apple silicon) | Supported | Supported and verified |
+| Windows | Supported | Same layout (`.exe` suffix), not yet verified |
+| Linux | Supported | Same layout, not yet verified |
+
+Code signing and notarization of the packaged backend are not yet handled.
 
 ## Example
 
-`examples/vue` is a Vue app demonstrating commands, raw bytes, concurrency, errors, timeouts,
-cancellation, channels and events. Its Python backend lives in `examples/vue/src-python`, a
-standalone uv project with its own venv that depends on the in-repo SDK (`../../../python-sdk`,
-editable).
+`examples/vue` is a complete Vue application that demonstrates commands, raw bytes,
+concurrency, errors, timeouts, cancellation, channels and events. Its backend in
+`examples/vue/src-python` is a standalone uv project that depends on the in-repo SDK in editable
+mode.
 
 ```bash
-cd examples/vue/src-python && uv sync   # create the example's venv (includes Nuitka)
+cd examples/vue/src-python && uv sync   # create the backend environment (includes Nuitka)
 cd .. && pnpm install && pnpm tauri dev
-pnpm tauri build                         # release build with the Nuitka-packaged backend
+pnpm tauri build                         # release build with the packaged backend
 ```
 
 ## Development
 
 ```bash
-cd python-sdk && uv sync                # SDK venv, used by the Rust integration tests
-cargo test                              # Rust unit + integration tests ($PYTHON overrides the interpreter)
+cd python-sdk && uv sync                # SDK environment, used by the Rust integration tests
+cargo test                              # Rust unit and integration tests ($PYTHON overrides the interpreter)
 cd python-sdk && uv run pytest          # Python SDK tests
-pnpm install && pnpm build              # build guest-js
+pnpm install && pnpm build              # build the frontend API (guest-js)
 ```
 
 ## Roadmap
 
-1. **Runtime core** (this release): process supervision, protocol, commands, events, channels,
-   Python SDK and frontend API.
-2. Desktop native APIs.
-3. System extensions.
-4. Hardware access.
-5. Build toolchain: packaging Python and dependencies with uv / Nuitka (standalone packaging via
-   `tauri-runtime build` is available; signing and cross-platform verification are pending).
+| Stage | Scope | Status |
+| --- | --- | --- |
+| 1. Runtime core | Process supervision, protocol, commands, events, channels, Python SDK and frontend API | Available |
+| 2. Build toolchain | Standalone packaging with Nuitka and project scaffolding | Available; signing and cross-platform verification pending |
+| 3. Desktop native APIs | Native desktop capabilities exposed to Python | Planned |
+| 4. System extensions | Deeper operating system integration | Planned |
+| 5. Hardware access | Access to devices and peripherals | Planned |

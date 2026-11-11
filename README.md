@@ -121,7 +121,7 @@ tauri::Builder::default()
 | Method | Default | Notes |
 | --- | --- | --- |
 | `script(path)` | – (required unless a bundle is used) | Python entry script, see [Script path resolution](#script-path-resolution) |
-| `python(program)` | `python3` (`python` on Windows) | Interpreter to run |
+| `python(program)` | `<script dir>/.venv` if present, else `python3` (`python` on Windows) | Interpreter to run |
 | `bundle(name)` | none | Release builds run the Nuitka-packaged backend instead, see [Packaging with Nuitka](#packaging-with-nuitka) |
 | `args(iter)` | none | Extra arguments passed after the script path (or to the packaged executable) |
 | `env(key, value)` | none | Extra environment variable for the Python process; call repeatedly |
@@ -180,12 +180,11 @@ Add `"py-runtime:default"` to your capability. It allows `invoke`, `cancel`, `em
 - If nothing is found, plugin setup fails with an error listing every path that was tried.
 - Python runs with the script's directory as its working directory.
 
-> In script mode the interpreter you configure must have `tauri-runtime` (and therefore
-> `pydantic`) importable. The example app has its own uv project in `src-python` (next to
-> `src-tauri`) whose venv installs the in-repo SDK in editable mode, and runs it in debug builds
-> via an absolute, compile-time path
-> (`concat!(env!("CARGO_MANIFEST_DIR"), "/../src-python/.venv/bin/python")`). Release builds
-> run the Nuitka-packaged backend instead, so end users don't need Python installed.
+> In script mode the interpreter must have `tauri-runtime` (and therefore `pydantic`)
+> importable. Without an explicit `python`, the plugin uses the virtual environment next to the
+> script (`.venv/bin/python`, `.venv\Scripts\python.exe` on Windows), so a `uv sync` in
+> `src-python` is all that's needed for `tauri dev`. Release builds run the Nuitka-packaged
+> backend instead, so end users don't need Python installed.
 
 ### Packaging with Nuitka
 

@@ -229,6 +229,16 @@ struct Environment<'a> {
   app_version: String,
 }
 
+/// 脚本目录下 uv / venv 创建的虚拟环境解释器（`.venv/bin/python`，Windows 为 `.venv\Scripts\python.exe`）。
+fn venv_python(script_dir: &Path) -> Option<PathBuf> {
+  let path = if cfg!(windows) {
+    script_dir.join(".venv").join("Scripts").join("python.exe")
+  } else {
+    script_dir.join(".venv").join("bin").join("python")
+  };
+  path.is_file().then_some(path)
+}
+
 fn default_python() -> &'static str {
   if cfg!(windows) {
     "python"
@@ -275,9 +285,11 @@ impl Builder {
     Self::default()
   }
 
-  /// 设置 Python 解释器（路径或命令名），默认 `python3`（Windows 上为 `python`）。
+  /// 设置 Python 解释器（路径或命令名）。
   ///
-  /// 该解释器必须能导入 `tauri_runtime`（及其依赖 `pydantic`）。
+  /// 未设置时，若脚本目录下存在 `.venv`（如 `uv sync` 创建的）则使用其中的解释器，
+  /// 否则为 `python3`（Windows 上为 `python`）。该解释器必须能导入 `tauri_runtime`
+  /// （及其依赖 `pydantic`）。
   pub fn python(mut self, program: impl Into<String>) -> Self {
     self.python = Some(program.into());
     self
@@ -385,8 +397,15 @@ impl Builder {
         let script = resolve_script(&script, env.cwd, env.resource_dir, env.dev)?;
         let mut args = vec![script.to_string_lossy().into_owned()];
         args.extend(extra);
-        let python = self.python.or_else(|| file.python.clone()).unwrap_or_else(|| default_python().into());
-        (PathBuf::from(python), args, script.parent().map(Path::to_path_buf))
+        let script_dir = script.parent().map(Path::to_path_buf);
+        let python = match self.python.or_else(|| file.python.clone()) {
+          Some(python) => PathBuf::from(python),
+          None => script_dir
+            .as_deref()
+            .and_then(venv_python)
+            .unwrap_or_else(|| default_python().into()),
+        };
+        (python, args, script_dir)
       }
     };
     Ok(SupervisorConfig {
@@ -612,6 +631,36 @@ mod tests {
   fn missing_script_is_a_config_error() {
     let err = Builder::new().into_config(None, &env(None, None, true)).unwrap_err();
     assert!(err.contains("no Python entry script"), "{err}");
+  }
+
+  fn venv_rel() -> &'static str {
+    if cfg!(windows) {
+      ".venv/Scripts/python.exe"
+    } else {
+      ".venv/bin/python"
+    }
+  }
+
+  #[test]
+  fn script_dir_venv_is_used_when_python_unset() {
+    let tmp = TempDir::new();
+    let script = tmp.touch("main.py");
+    let python = tmp.touch(venv_rel());
+    let config = Builder::new().script(&script).into_config(None, &env(None, None, true)).unwrap();
+    assert_eq!(config.process.program, python);
+  }
+
+  #[test]
+  fn explicit_python_wins_over_venv() {
+    let tmp = TempDir::new();
+    let script = tmp.touch("main.py");
+    tmp.touch(venv_rel());
+    let config = Builder::new()
+      .script(&script)
+      .python("custom-python")
+      .into_config(None, &env(None, None, true))
+      .unwrap();
+    assert_eq!(config.process.program, PathBuf::from("custom-python"));
   }
 
   fn exe(name: &str) -> String {

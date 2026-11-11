@@ -1,1 +1,1 @@
-# tauri-plugin-py-runtime
+# Tauri Plugin py-runtime

@@ -1,7 +1,16 @@
 {
   "name": "tauri-plugin-py-runtime-api",
   "version": "0.1.0",
-  "description": "Frontend API for tauri-plugin-py-runtime",
+  "description": "Frontend API for tauri-plugin-py-runtime: call Python backends from Tauri 2 apps",
+  "license": "MIT OR Apache-2.0",
+  "author": "InfernalAzazel",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/InfernalAzazel/tauri-plugin-py-runtime.git"
+  },
+  "homepage": "https://github.com/InfernalAzazel/tauri-plugin-py-runtime#readme",
+  "bugs": "https://github.com/InfernalAzazel/tauri-plugin-py-runtime/issues",
+  "keywords": ["tauri", "tauri-plugin", "python", "ipc", "desktop"],
   "type": "module",
   "main": "./dist-js/index.js",
   "types": "./dist-js/index.d.ts",
@@ -11,7 +20,7 @@
       "import": "./dist-js/index.js"
     }
   },
-  "files": ["dist-js", "README.md"],
+  "files": ["dist-js", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "prepare": "tsc -p tsconfig.json"

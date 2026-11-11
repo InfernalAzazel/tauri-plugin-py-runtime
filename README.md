@@ -44,7 +44,10 @@ app.run()
   - `App` – the app instance.
 - Return any JSON-serializable value (dataclasses and pydantic models are supported).
   Return `Raw(...)` or `bytes` to send binary data; the frontend receives a `Uint8Array`.
+  `NaN` and `±Infinity` are not valid JSON and are rejected: returning them fails the call
+  with `internal` (sending them on a channel or with `emit` raises `ValueError`).
 - Raise `TauriError(code, message, data)` to return a structured error with your own code.
+  If `data` isn't JSON-serializable, the error is sent without `data` and a `[WARN]` is logged.
   Any other exception becomes `internal` with `data = {"type": "<ExceptionName>"}`; set
   `TAURI_RUNTIME_DEBUG=1` in the Python environment to also include the traceback.
 - `@app.command("name")` registers under a different name.
@@ -53,7 +56,9 @@ app.run()
   `@app.on("shutdown")` when the app exits (bounded by the shutdown timeout).
 - Events: `@app.listen("name")` receives events sent with `pyEmit` (handler gets an `Event`
   with `name`, `payload`, `window`). `await app.emit("name", payload, target=None)` sends an
-  event to the frontend; `target` is a webview label, otherwise it is broadcast.
+  event to the frontend; `target` is a webview label, otherwise it is broadcast. The name
+  `exited` is reserved for the runtime's own `py://exited` event; `app.emit("exited", ...)`
+  raises `ValueError`.
 - Cancelling a call cancels the asyncio task of an `async def` command. A plain `def` command
   keeps running in its worker thread until it returns (Python can't interrupt threads); its
   result is discarded.
@@ -79,7 +84,7 @@ tauri::Builder::default()
 | `python(program)` | `python3` (`python` on Windows) | Interpreter to run |
 | `args(iter)` | none | Extra arguments passed after the script path |
 | `env(key, value)` | none | Extra environment variable for the Python process; call repeatedly |
-| `invoke_timeout(Duration)` | 30 s | Default timeout per call |
+| `invoke_timeout(Duration)` | 30 s | Default timeout per call; a per-call `timeoutMs` is capped at 10× this value |
 | `shutdown_timeout(Duration)` | 3 s | Time Python gets to run shutdown hooks |
 | `handshake_timeout(Duration)` | 10 s | Time Python gets to start and send its handshake; also how long a call waits for a runtime that is still starting |
 | `restart_on_crash(bool)` | `false` | See [Process lifecycle](#process-lifecycle) |
@@ -161,11 +166,24 @@ console.log(await pyStatus()); // "starting" | "running" | "crashed" | "stopped"
   bytes, received by a `Raw` parameter). Binary results come back as a `Uint8Array`.
 - `Channel` values are only detected at the **top level** of `args`. A channel nested inside
   an object or array is serialized as a plain value and is not wired up in Python.
-- `options.timeoutMs` overrides the default invoke timeout for this call. On timeout the call
-  rejects with `timeout` and Python receives a cancel for it.
+- `options.timeoutMs` overrides the default invoke timeout for this call. It must be a
+  non-negative integer (otherwise `pyInvoke` throws `invalid_args`) and is capped at 10× the
+  configured `invoke_timeout` (5 min with the 30 s default). On timeout the call rejects with
+  `timeout` and Python receives a cancel for it.
 - `options.signal` (an `AbortSignal`) cancels the call: the promise rejects with `cancelled`
   immediately on abort, without waiting for the backend, and a cancel is forwarded to Python.
   An already-aborted signal rejects before anything is sent.
+- Each call carries a client call id that is scoped to the calling window: a webview can only
+  cancel its own calls, and a second call reusing an id that is still pending in the same
+  window is rejected with `invalid_args`. `pyInvoke` generates unique ids for you.
+
+### Channels
+
+- Values sent with `ch.send(...)` arrive in `onmessage` in order. Raw bytes (`Raw` / `bytes`)
+  arrive as an `ArrayBuffer`, not a `Uint8Array`; declare the channel as `Channel<ArrayBuffer>`.
+- Channel messages and the call result travel separately, so the last `onmessage` can run
+  **after** `pyInvoke` has resolved. If you need strict ordering, send an explicit end marker
+  on the channel (e.g. `{ done: true }`) and wait for it instead of relying on the promise.
 
 ### Events
 
@@ -218,8 +236,13 @@ Codes raised with `TauriError` in Python are passed through unchanged.
   stayed up for at least 30 s. If a restarted process fails its handshake, restarting stops and
   the status becomes `failed`.
 - On app exit, Rust sends a Shutdown frame with `timeoutMs` (the shutdown timeout). Python
-  cancels running calls, runs `shutdown` hooks within that time and exits. If the process is
+  cancels running calls and runs `shutdown` hooks, all within that one budget (an invalid
+  `timeoutMs` or a closed stdin falls back to 3 s), then exits. Handlers that ignore
+  cancellation and stuck `def` handlers are abandoned rather than awaited. If the process is
   still alive after the shutdown timeout plus 1 s of grace, it is killed.
+- `app.run()` always ends the process: if an exception escapes (including `sys.exit()` or
+  `KeyboardInterrupt` raised from a handler) it flushes output and exits with the
+  `sys.exit` code, or 1 for any other exception.
 
 ## Logging
 

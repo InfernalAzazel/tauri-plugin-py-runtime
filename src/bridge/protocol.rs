@@ -1,5 +1,6 @@
+use bytes::{BufMut, BytesMut};
 use serde_json::{Map, Value};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec, LengthDelimitedCodecError};
 
 use crate::error::{codes, Error};
 
@@ -45,17 +46,10 @@ impl TryFrom<u8> for FrameKind {
 pub enum ProtocolError {
   #[error("io error: {0}")]
   Io(#[from] std::io::Error),
-  #[error("frame of {0} bytes exceeds limit")]
+  #[error("frame exceeds limit of {0} bytes")]
   TooLarge(usize),
   #[error("malformed frame: {0}")]
   Malformed(String),
-}
-
-impl ProtocolError {
-  /// The stream is still aligned on a frame boundary and reading can continue.
-  pub fn is_recoverable(&self) -> bool {
-    !matches!(self, Self::Io(_))
-  }
 }
 
 impl From<ProtocolError> for Error {
@@ -152,19 +146,7 @@ pub fn encoded_len(frame: &Frame) -> usize {
   1 + 4 + header_bytes(frame).len() + frame.body.len()
 }
 
-pub fn encode(frame: &Frame) -> Vec<u8> {
-  let header = header_bytes(frame);
-  let inner = 1 + 4 + header.len() + frame.body.len();
-  let mut out = Vec::with_capacity(4 + inner);
-  out.extend_from_slice(&(inner as u32).to_be_bytes());
-  out.push(frame.kind as u8);
-  out.extend_from_slice(&(header.len() as u32).to_be_bytes());
-  out.extend_from_slice(&header);
-  out.extend_from_slice(&frame.body);
-  out
-}
-
-pub fn decode(buf: &[u8]) -> Result<Frame, ProtocolError> {
+fn parse(buf: &[u8]) -> Result<Frame, ProtocolError> {
   if buf.len() < 5 {
     return Err(ProtocolError::Malformed("frame shorter than 5 bytes".into()));
   }
@@ -186,33 +168,57 @@ pub fn decode(buf: &[u8]) -> Result<Frame, ProtocolError> {
   Ok(Frame { kind, header, body: buf[end..].to_vec() })
 }
 
-pub async fn read_frame<R: AsyncRead + Unpin>(
-  reader: &mut R,
-  max_size: usize,
-) -> Result<Option<Frame>, ProtocolError> {
-  let mut prefix = [0u8; 4];
-  match reader.read_exact(&mut prefix).await {
-    Ok(_) => {}
-    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-    Err(e) => return Err(e.into()),
-  }
-  let size = u32::from_be_bytes(prefix) as usize;
-  if size > max_size {
-    let mut limited = (&mut *reader).take(size as u64);
-    let skipped = tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
-    if skipped as usize != size {
-      return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
-    }
-    return Err(ProtocolError::TooLarge(size));
-  }
-  let mut buf = vec![0u8; size];
-  reader.read_exact(&mut buf).await?;
-  decode(&buf).map(Some)
+/// Frames on top of [`LengthDelimitedCodec`] (u32 big-endian length prefix, capped at
+/// `max_frame_size`).
+///
+/// Decoding yields `Ok(Err(_))` for a complete but malformed frame (unknown kind, bad header):
+/// the stream is still aligned on a frame boundary and reading can continue. `Err(_)` is fatal,
+/// including [`ProtocolError::TooLarge`] for a length prefix above the limit: both sides check
+/// sizes before sending, so an oversized frame means a broken peer and is not skipped.
+pub struct FrameCodec {
+  inner: LengthDelimitedCodec,
+  max_frame_size: usize,
 }
 
-pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -> std::io::Result<()> {
-  writer.write_all(&encode(frame)).await?;
-  writer.flush().await
+impl FrameCodec {
+  pub fn new(max_frame_size: usize) -> Self {
+    let inner = LengthDelimitedCodec::builder()
+      .big_endian()
+      .length_field_type::<u32>()
+      .max_frame_length(max_frame_size)
+      .new_codec();
+    Self { inner, max_frame_size }
+  }
+}
+
+impl Decoder for FrameCodec {
+  type Item = Result<Frame, ProtocolError>;
+  type Error = ProtocolError;
+
+  fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, ProtocolError> {
+    let chunk = self.inner.decode(src).map_err(|e| {
+      if e.get_ref().is_some_and(|inner| inner.is::<LengthDelimitedCodecError>()) {
+        ProtocolError::TooLarge(self.max_frame_size)
+      } else {
+        ProtocolError::Io(e)
+      }
+    })?;
+    Ok(chunk.map(|buf| parse(&buf)))
+  }
+}
+
+impl Encoder<Frame> for FrameCodec {
+  type Error = std::io::Error;
+
+  fn encode(&mut self, frame: Frame, dst: &mut BytesMut) -> std::io::Result<()> {
+    let header = header_bytes(&frame);
+    let mut buf = BytesMut::with_capacity(5 + header.len() + frame.body.len());
+    buf.put_u8(frame.kind as u8);
+    buf.put_u32(header.len() as u32);
+    buf.put_slice(&header);
+    buf.put_slice(&frame.body);
+    self.inner.encode(buf.freeze(), dst)
+  }
 }
 
 #[cfg(test)]
@@ -224,14 +230,22 @@ mod tests {
     Frame::with_payload(FrameKind::Request, json!({"id": 1, "cmd": "hello"}), Payload::Raw(vec![0, 255]))
   }
 
-  #[tokio::test]
-  async fn roundtrip() {
+  fn encode(frame: &Frame) -> Vec<u8> {
+    let mut buf = BytesMut::new();
+    FrameCodec::new(DEFAULT_MAX_FRAME_SIZE).encode(frame.clone(), &mut buf).unwrap();
+    buf.to_vec()
+  }
+
+  #[test]
+  fn roundtrip() {
     let frame = sample();
     let data = encode(&frame);
-    let got = read_frame(&mut &data[..], DEFAULT_MAX_FRAME_SIZE).await.unwrap().unwrap();
+    let mut buf = BytesMut::from(&data[..]);
+    let got = FrameCodec::new(DEFAULT_MAX_FRAME_SIZE).decode(&mut buf).unwrap().unwrap().unwrap();
     assert_eq!(got, frame);
     assert_eq!(got.header_str("encoding"), Some("raw"));
     assert_eq!(encoded_len(&frame), data.len() - 4);
+    assert!(buf.is_empty());
   }
 
   #[test]
@@ -246,33 +260,37 @@ mod tests {
     assert_eq!(&data[9..], [&header[..], b"xy"].concat().as_slice());
   }
 
-  #[tokio::test]
-  async fn eof_returns_none() {
-    let empty: &[u8] = &[];
-    assert!(read_frame(&mut &empty[..], 1024).await.unwrap().is_none());
+  #[test]
+  fn partial_input_waits_and_truncated_eof_is_fatal() {
+    let data = encode(&sample());
+    let mut codec = FrameCodec::new(DEFAULT_MAX_FRAME_SIZE);
+    let mut buf = BytesMut::from(&data[..data.len() - 1]);
+    assert!(codec.decode(&mut buf).unwrap().is_none());
+    assert!(codec.decode_eof(&mut buf).is_err());
+    assert!(codec.decode_eof(&mut BytesMut::new()).unwrap().is_none());
   }
 
-  #[tokio::test]
-  async fn too_large_frame_is_skipped() {
+  #[test]
+  fn oversized_frame_is_fatal() {
     let big = Frame::with_payload(FrameKind::Event, json!({"event": "x"}), Payload::Raw(vec![1; 100]));
-    let small = Frame::new(FrameKind::Event, json!({"event": "y"}));
-    let data = [encode(&big), encode(&small)].concat();
-    let mut reader = &data[..];
-    let err = read_frame(&mut reader, 64).await.unwrap_err();
-    assert!(matches!(err, ProtocolError::TooLarge(_)));
-    assert!(err.is_recoverable());
-    assert_eq!(read_frame(&mut reader, 64).await.unwrap().unwrap(), small);
+    let mut buf = BytesMut::from(&encode(&big)[..]);
+    let err = FrameCodec::new(64).decode(&mut buf).unwrap_err();
+    assert!(matches!(err, ProtocolError::TooLarge(64)), "{err:?}");
+    assert_eq!(Error::from(err).code, codes::FRAME_TOO_LARGE);
   }
 
-  #[tokio::test]
-  async fn unknown_kind_is_recoverable() {
-    let mut bad = encode(&Frame::new(FrameKind::Event, json!({})));
-    bad[4] = 0x7f;
+  #[test]
+  fn malformed_frames_are_skipped() {
+    let mut unknown_kind = encode(&Frame::new(FrameKind::Event, json!({})));
+    unknown_kind[4] = 0x7f;
+    let mut bad_json = encode(&Frame::new(FrameKind::Event, json!({"event": "x"})));
+    bad_json[9] = b'[';
     let good = Frame::new(FrameKind::Event, json!({"event": "ok"}));
-    let data = [bad, encode(&good)].concat();
-    let mut reader = &data[..];
-    assert!(read_frame(&mut reader, 1024).await.unwrap_err().is_recoverable());
-    assert_eq!(read_frame(&mut reader, 1024).await.unwrap().unwrap(), good);
+    let mut buf = BytesMut::from(&[unknown_kind, bad_json, encode(&good)].concat()[..]);
+    let mut codec = FrameCodec::new(1024);
+    assert!(matches!(codec.decode(&mut buf).unwrap(), Some(Err(ProtocolError::Malformed(_)))));
+    assert!(matches!(codec.decode(&mut buf).unwrap(), Some(Err(ProtocolError::Malformed(_)))));
+    assert_eq!(codec.decode(&mut buf).unwrap().unwrap().unwrap(), good);
   }
 
   #[test]

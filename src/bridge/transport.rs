@@ -1,7 +1,9 @@
+use futures_util::SinkExt;
 use tokio::{io::AsyncWrite, sync::mpsc};
+use tokio_util::codec::FramedWrite;
 
 use crate::{
-  bridge::protocol::{encoded_len, write_frame, Frame},
+  bridge::protocol::{encoded_len, Frame, FrameCodec},
   error::{codes, Error, Result},
 };
 
@@ -18,11 +20,12 @@ impl Writer {
     (Self { tx, max_frame_size }, rx)
   }
 
-  pub fn spawn<W: AsyncWrite + Unpin + Send + 'static>(mut stream: W, max_frame_size: usize) -> Self {
+  pub fn spawn<W: AsyncWrite + Unpin + Send + 'static>(stream: W, max_frame_size: usize) -> Self {
     let (writer, mut rx) = Self::channel(max_frame_size);
     tauri::async_runtime::spawn(async move {
+      let mut sink = FramedWrite::new(stream, FrameCodec::new(max_frame_size));
       while let Some(frame) = rx.recv().await {
-        if let Err(e) = write_frame(&mut stream, &frame).await {
+        if let Err(e) = sink.send(frame).await {
           log::error!(target: "py-runtime", "failed to write frame: {e}");
           break;
         }
@@ -49,18 +52,21 @@ impl Writer {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::bridge::protocol::{read_frame, FrameKind, Payload, DEFAULT_MAX_FRAME_SIZE};
+  use crate::bridge::protocol::{FrameKind, Payload, DEFAULT_MAX_FRAME_SIZE};
+  use futures_util::StreamExt;
   use serde_json::json;
+  use tokio_util::codec::FramedRead;
 
   #[tokio::test]
   async fn spawned_writer_writes_frames_in_order() {
-    let (a, mut b) = tokio::io::duplex(1024);
+    let (a, b) = tokio::io::duplex(1024);
     let writer = Writer::spawn(a, DEFAULT_MAX_FRAME_SIZE);
+    let mut frames = FramedRead::new(b, FrameCodec::new(DEFAULT_MAX_FRAME_SIZE));
     for i in 0..3u64 {
       writer.send(Frame::new(FrameKind::Event, json!({"i": i}))).unwrap();
     }
     for i in 0..3u64 {
-      let frame = read_frame(&mut b, DEFAULT_MAX_FRAME_SIZE).await.unwrap().unwrap();
+      let frame = frames.next().await.unwrap().unwrap().unwrap();
       assert_eq!(frame.header_u64("i"), Some(i));
     }
   }

@@ -6,16 +6,15 @@ use std::{
   time::{Duration, Instant},
 };
 
+use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::json;
-use tokio::{
-  io::BufReader,
-  sync::{watch, Notify},
-};
+use tokio::sync::{watch, Notify};
+use tokio_util::codec::FramedRead;
 
 use crate::{
   bridge::{
-    protocol::{read_frame, PROTOCOL_VERSION},
+    protocol::{FrameCodec, PROTOCOL_VERSION},
     Bridge, CallOptions, ChannelSink, EventSink, Frame, FrameKind, Payload, Writer,
   },
   error::{codes, Error, Result},
@@ -155,24 +154,23 @@ impl Supervisor {
     };
     process::spawn_stderr_logger(stderr);
     let writer = Writer::spawn(stdin, self.config.max_frame_size);
-    let mut reader = BufReader::new(stdout);
-    let max = self.config.max_frame_size;
+    let mut frames = FramedRead::new(stdout, FrameCodec::new(self.config.max_frame_size));
 
     let handshake = tokio::select! {
-      result = tokio::time::timeout(self.config.handshake_timeout, read_frame(&mut reader, max)) => result,
+      result = tokio::time::timeout(self.config.handshake_timeout, frames.next()) => result,
       _ = self.kill.notified() => return self.stop_child(child).await,
     };
     let failure = match handshake {
-      Ok(Ok(Some(hello))) if hello.kind == FrameKind::Hello => match hello.header_u64("protocol") {
+      Ok(Some(Ok(Ok(hello)))) if hello.kind == FrameKind::Hello => match hello.header_u64("protocol") {
         Some(PROTOCOL_VERSION) => None,
         other => Some((
           codes::PROTOCOL_MISMATCH,
           format!("python sdk speaks protocol {other:?}, expected {PROTOCOL_VERSION}"),
         )),
       },
-      Ok(Ok(Some(frame))) => Some((codes::RUNTIME_UNAVAILABLE, format!("expected Hello, got {:?}", frame.kind))),
-      Ok(Ok(None)) => Some((codes::RUNTIME_UNAVAILABLE, "python exited before handshake".into())),
-      Ok(Err(e)) => Some((codes::RUNTIME_UNAVAILABLE, format!("handshake failed: {e}"))),
+      Ok(Some(Ok(Ok(frame)))) => Some((codes::RUNTIME_UNAVAILABLE, format!("expected Hello, got {:?}", frame.kind))),
+      Ok(Some(Ok(Err(e)) | Err(e))) => Some((codes::RUNTIME_UNAVAILABLE, format!("handshake failed: {e}"))),
+      Ok(None) => Some((codes::RUNTIME_UNAVAILABLE, "python exited before handshake".into())),
       Err(_) => Some((codes::RUNTIME_UNAVAILABLE, "handshake timed out".into())),
     };
     if let Some((code, message)) = failure {
@@ -196,14 +194,15 @@ impl Supervisor {
 
     loop {
       tokio::select! {
-        result = read_frame(&mut reader, max) => match result {
-          Ok(Some(frame)) => self.bridge.handle(frame, self.sink.as_ref()),
-          Ok(None) => break,
-          Err(e) if e.is_recoverable() => log::warn!(target: "py-runtime", "dropped frame from python: {e}"),
-          Err(e) => {
+        next = frames.next() => match next {
+          Some(Ok(Ok(frame))) => self.bridge.handle(frame, self.sink.as_ref()),
+          Some(Ok(Err(e))) => log::warn!(target: "py-runtime", "dropped frame from python: {e}"),
+          Some(Err(e)) => {
             log::error!(target: "py-runtime", "failed to read from python: {e}");
+            let _ = child.kill().await;
             break;
           }
+          None => break,
         },
         _ = self.kill.notified() => {
           let _ = child.kill().await;

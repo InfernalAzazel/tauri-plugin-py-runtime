@@ -25,15 +25,25 @@ impl EventSink for Recorder {
   }
 }
 
-fn python() -> String {
-  std::env::var("PYTHON").unwrap_or_else(|_| if cfg!(windows) { "python".into() } else { "python3".into() })
+/// `$PYTHON`, else the python-sdk venv (`uv sync`), which has the SDK's dependencies.
+fn python() -> PathBuf {
+  if let Ok(python) = std::env::var("PYTHON") {
+    return python.into();
+  }
+  let venv = if cfg!(windows) { ".venv/Scripts/python.exe" } else { ".venv/bin/python" };
+  let venv = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python-sdk").join(venv);
+  if venv.exists() {
+    venv
+  } else {
+    (if cfg!(windows) { "python" } else { "python3" }).into()
+  }
 }
 
 fn config(args: Vec<String>) -> SupervisorConfig {
   let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
   SupervisorConfig {
     process: ProcessConfig {
-      program: python().into(),
+      program: python(),
       args,
       envs: vec![("PYTHONPATH".into(), root.join("python-sdk").to_string_lossy().into_owned())],
       cwd: None,

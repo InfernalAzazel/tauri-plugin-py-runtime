@@ -7,14 +7,10 @@ import typing
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from pydantic import TypeAdapter, ValidationError
+
 from .channel import Channel
 from .protocol import Raw
-
-try:
-    from pydantic import TypeAdapter, ValidationError
-except ImportError:  # pydantic is optional
-    TypeAdapter = None  # type: ignore[assignment,misc]
-    ValidationError = None  # type: ignore[assignment,misc]
 
 
 class TauriError(Exception):
@@ -74,7 +70,7 @@ def _classify(annotation: Any, app_type: type) -> int:
 
 
 def _adapter(annotation: Any) -> Any:
-    if TypeAdapter is None or annotation is inspect.Parameter.empty:
+    if annotation is inspect.Parameter.empty:
         return None
     try:
         return TypeAdapter(annotation)

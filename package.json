@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Frontend API for tauri-plugin-py-runtime: call Python backends from Tauri 2 apps",
   "license": "MIT OR Apache-2.0",
-  "author": "InfernalAzazel",
+  "author": "kylin",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/InfernalAzazel/tauri-plugin-py-runtime.git"

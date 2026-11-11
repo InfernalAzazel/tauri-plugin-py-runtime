@@ -9,7 +9,7 @@ description = "Write the backend of Tauri 2 desktop apps in Python: commands, ev
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
-authors = [{ name = "InfernalAzazel" }]
+authors = [{ name = "kylin" }]
 requires-python = ">=3.11"
 dependencies = ["pydantic>=2.9"]
 keywords = ["tauri", "desktop", "gui", "ipc", "nuitka"]

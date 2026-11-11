@@ -1,0 +1,12 @@
+[project]
+name = "vue-example-backend"
+version = "0.1.0"
+description = "Python backend of the tauri-plugin-py-runtime Vue example"
+requires-python = ">=3.10"
+dependencies = ["tauri-runtime"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+tauri-runtime = { path = "../../../python-sdk", editable = true }

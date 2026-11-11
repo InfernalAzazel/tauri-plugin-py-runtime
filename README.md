@@ -111,7 +111,7 @@ app.run()
 tauri::Builder::default()
     .plugin(
         tauri_plugin_py_runtime::Builder::new()
-            .script("../python/main.py")
+            .script("../src-python/main.py")
             .build(),
     )
 ```
@@ -142,7 +142,7 @@ startup instead of being ignored:
   "plugins": {
     "py-runtime": {
       "python": "python3",
-      "script": "../python/main.py",
+      "script": "../src-python/main.py",
       "args": ["--verbose"],
       "invokeTimeoutMs": 30000,
       "shutdownTimeoutMs": 3000,
@@ -168,22 +168,22 @@ Add `"py-runtime:default"` to your capability. It allows `invoke`, `cancel`, `em
 - An absolute path is used as is.
 - A relative path is tried against these locations, first existing file wins:
   1. Debug builds only: the process working directory. Under `tauri dev` that is `src-tauri`,
-     so `"../python/main.py"` points at `<project>/python/main.py`.
+     so `"../src-python/main.py"` points at `<project>/src-python/main.py`.
   2. The app's resource directory, with every `..` component replaced by `_up_` (the same
      layout Tauri's bundler uses for `bundle.resources`).
 - Release builds only look in the resource directory, so the script has to be shipped via
   `bundle.resources`:
-  - list form: `"resources": ["../python/**/*"]` together with `script: "../python/main.py"`;
-  - map form: `"resources": { "../python/": "python/" }` together with `script: "python/main.py"`.
+  - list form: `"resources": ["../src-python/**/*"]` together with `script: "../src-python/main.py"`;
+  - map form: `"resources": { "../src-python/": "src-python/" }` together with `script: "src-python/main.py"`.
 - If nothing is found, plugin setup fails with an error listing every path that was tried.
 - Python runs with the script's directory as its working directory.
 
 > This phase does not package a Python interpreter or your dependencies: the interpreter you
-> configure must have `tauri-runtime` (and therefore `pydantic`) importable. The example app runs
-> the in-repo SDK's venv (`python-sdk/.venv`, created by `uv sync`, which installs the SDK in
-> editable mode) via an absolute, compile-time path
-> (`concat!(env!("CARGO_MANIFEST_DIR"), "/../../../python-sdk/.venv/bin/python")`), which only
-> works on the machine that built it. Bundling Python and dependencies (uv / Nuitka) is planned
+> configure must have `tauri-runtime` (and therefore `pydantic`) importable. The example app has
+> its own uv project in `src-python` (next to `src-tauri`) whose venv installs the in-repo SDK in
+> editable mode, and runs it via an absolute, compile-time path
+> (`concat!(env!("CARGO_MANIFEST_DIR"), "/../src-python/.venv/bin/python")`), which only works on
+> the machine that built it. Bundling Python and dependencies (uv / Nuitka) is planned
 > for phase 5.
 
 ## Frontend
@@ -332,16 +332,19 @@ Install a logger (e.g. `tauri-plugin-log`) to see the output.
 ## Example
 
 `examples/vue` is a Vue app demonstrating commands, raw bytes, concurrency, errors, timeouts,
-cancellation, channels and events. Its Python backend is `examples/vue/python/main.py`.
+cancellation, channels and events. Its Python backend lives in `examples/vue/src-python`, a
+standalone uv project with its own venv that depends on the in-repo SDK (`../../../python-sdk`,
+editable).
 
 ```bash
-cd examples/vue && pnpm install && pnpm tauri dev
+cd examples/vue/src-python && uv sync   # create the example's venv
+cd .. && pnpm install && pnpm tauri dev
 ```
 
 ## Development
 
 ```bash
-cd python-sdk && uv sync                # SDK venv, used by the Rust integration tests and the example
+cd python-sdk && uv sync                # SDK venv, used by the Rust integration tests
 cargo test                              # Rust unit + integration tests ($PYTHON overrides the interpreter)
 cd python-sdk && uv run pytest          # Python SDK tests
 pnpm install && pnpm build              # build guest-js

@@ -17,7 +17,7 @@
 //!
 //! let _app = tauri::Builder::default().plugin(
 //!   tauri_plugin_py_runtime::Builder::new()
-//!     .script("../python/main.py")
+//!     .script("../src-python/main.py")
 //!     .invoke_timeout(Duration::from_secs(60))
 //!     .build(),
 //! );
@@ -30,7 +30,7 @@
 //!   "plugins": {
 //!     "py-runtime": {
 //!       "python": "python3",
-//!       "script": "../python/main.py",
+//!       "script": "../src-python/main.py",
 //!       "invokeTimeoutMs": 30000,
 //!       "restartOnCrash": false
 //!     }
@@ -222,7 +222,7 @@ fn default_python() -> &'static str {
 /// use std::time::Duration;
 ///
 /// let plugin = tauri_plugin_py_runtime::Builder::new()
-///   .script("../python/main.py")
+///   .script("../src-python/main.py")
 ///   .python("python3")
 ///   .args(["--verbose"])
 ///   .env("APP_MODE", "dev")
@@ -262,7 +262,7 @@ impl Builder {
   /// 绝对路径原样使用。相对路径按以下顺序尝试，第一个存在的文件胜出：仅在 debug 构建中，
   /// 相对于当前工作目录（`tauri dev` 下为 `src-tauri`）；然后在所有构建中，相对于资源目录，
   /// 并把每个 `..` 替换为 `_up_`（与打包器布局一致）。因此当 `bundle.resources` 包含
-  /// `"../python/**/*"` 时，`"../python/main.py"` 在开发与发布构建中都能找到。
+  /// `"../src-python/**/*"` 时，`"../src-python/main.py"` 在开发与发布构建中都能找到。
   /// Python 以脚本所在目录作为工作目录运行。
   pub fn script(mut self, path: impl Into<PathBuf>) -> Self {
     self.script = Some(path.into());

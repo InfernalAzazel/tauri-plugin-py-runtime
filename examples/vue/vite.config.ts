@@ -5,6 +5,9 @@ const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig({
   plugins: [vue()],
+  resolve: {
+    dedupe: ["@tauri-apps/api"],
+  },
   clearScreen: false,
   server: {
     port: 1420,

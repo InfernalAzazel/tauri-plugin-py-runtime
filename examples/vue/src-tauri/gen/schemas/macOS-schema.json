@@ -2217,22 +2217,76 @@
           "markdownDescription": "Denies the unminimize command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-ping`",
+          "description": "Allows the log command\n#### This default permission set includes:\n\n- `allow-log`",
+          "type": "string",
+          "const": "log:default",
+          "markdownDescription": "Allows the log command\n#### This default permission set includes:\n\n- `allow-log`"
+        },
+        {
+          "description": "Enables the log command without any pre-configured scope.",
+          "type": "string",
+          "const": "log:allow-log",
+          "markdownDescription": "Enables the log command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the log command without any pre-configured scope.",
+          "type": "string",
+          "const": "log:deny-log",
+          "markdownDescription": "Denies the log command without any pre-configured scope."
+        },
+        {
+          "description": "Allows calling Python commands, exchanging events and reading the runtime status\n#### This default permission set includes:\n\n- `allow-invoke`\n- `allow-cancel`\n- `allow-emit`\n- `allow-status`",
           "type": "string",
           "const": "py-runtime:default",
-          "markdownDescription": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-ping`"
+          "markdownDescription": "Allows calling Python commands, exchanging events and reading the runtime status\n#### This default permission set includes:\n\n- `allow-invoke`\n- `allow-cancel`\n- `allow-emit`\n- `allow-status`"
         },
         {
-          "description": "Enables the ping command without any pre-configured scope.",
+          "description": "Enables the cancel command without any pre-configured scope.",
           "type": "string",
-          "const": "py-runtime:allow-ping",
-          "markdownDescription": "Enables the ping command without any pre-configured scope."
+          "const": "py-runtime:allow-cancel",
+          "markdownDescription": "Enables the cancel command without any pre-configured scope."
         },
         {
-          "description": "Denies the ping command without any pre-configured scope.",
+          "description": "Enables the emit command without any pre-configured scope.",
           "type": "string",
-          "const": "py-runtime:deny-ping",
-          "markdownDescription": "Denies the ping command without any pre-configured scope."
+          "const": "py-runtime:allow-emit",
+          "markdownDescription": "Enables the emit command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the invoke command without any pre-configured scope.",
+          "type": "string",
+          "const": "py-runtime:allow-invoke",
+          "markdownDescription": "Enables the invoke command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the status command without any pre-configured scope.",
+          "type": "string",
+          "const": "py-runtime:allow-status",
+          "markdownDescription": "Enables the status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "py-runtime:deny-cancel",
+          "markdownDescription": "Denies the cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the emit command without any pre-configured scope.",
+          "type": "string",
+          "const": "py-runtime:deny-emit",
+          "markdownDescription": "Denies the emit command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the invoke command without any pre-configured scope.",
+          "type": "string",
+          "const": "py-runtime:deny-invoke",
+          "markdownDescription": "Denies the invoke command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the status command without any pre-configured scope.",
+          "type": "string",
+          "const": "py-runtime:deny-status",
+          "markdownDescription": "Denies the status command without any pre-configured scope."
         }
       ]
     },

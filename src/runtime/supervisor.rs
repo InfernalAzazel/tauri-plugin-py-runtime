@@ -61,6 +61,9 @@ pub struct SupervisorConfig {
   pub handshake_timeout: Duration,
   pub invoke_timeout: Duration,
   pub shutdown_timeout: Duration,
+  /// Restart python after an unexpected exit, with exponential backoff (1 s doubling up to 30 s,
+  /// reset after 30 s of uptime). A failed handshake on a restarted process ends auto-restart and
+  /// leaves the supervisor in [`Status::Failed`].
   pub restart_on_crash: bool,
   pub max_frame_size: usize,
   pub app_name: String,
@@ -121,11 +124,11 @@ impl Supervisor {
       }
 
       self.sink.exited(code);
+      self.status.send_replace(Status::Starting);
       if self.stopping.load(Ordering::SeqCst) {
         self.status.send_replace(Status::Stopped);
         return;
       }
-      self.status.send_replace(Status::Starting);
       crashes = if uptime >= STABLE_UPTIME { 1 } else { crashes + 1 };
       let delay = RESTART_DELAY
         .saturating_mul(1 << (crashes - 1).min(5))
@@ -308,22 +311,17 @@ impl Supervisor {
     self.stopping.store(true, Ordering::SeqCst);
     let budget = self.config.shutdown_timeout + SHUTDOWN_GRACE;
     let writer = self.writer.lock().unwrap().take();
-    let Some(writer) = writer else {
-      match self.status() {
-        Status::Starting => {
-          self.kill.notify_one();
-          self.wait_stopped(budget).await;
-        }
-        Status::Running => {
-          self.wait_stopped(budget).await;
-        }
-        _ => {}
+    match writer {
+      Some(writer) => {
+        let timeout_ms = self.config.shutdown_timeout.as_millis() as u64;
+        let _ = writer.send(Frame::new(FrameKind::Shutdown, json!({ "timeoutMs": timeout_ms })));
       }
-      return;
-    };
-    let timeout_ms = self.config.shutdown_timeout.as_millis() as u64;
-    let _ = writer.send(Frame::new(FrameKind::Shutdown, json!({ "timeoutMs": timeout_ms })));
-    drop(writer);
+      None => match self.status() {
+        Status::Starting => self.kill.notify_one(),
+        Status::Running => {}
+        _ => return,
+      },
+    }
 
     if !self.wait_stopped(budget).await {
       log::warn!(target: "py-runtime", "python runtime did not exit in time, killing it");

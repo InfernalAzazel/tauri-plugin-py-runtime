@@ -1,9 +1,11 @@
 use std::{path::PathBuf, process::Stdio};
 
 use tokio::{
-  io::{AsyncBufReadExt, BufReader},
+  io::{AsyncBufReadExt, AsyncReadExt, BufReader},
   process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
 };
+
+const MAX_LOG_LINE: u64 = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ProcessConfig {
@@ -48,7 +50,7 @@ pub fn spawn_stderr_logger(stderr: ChildStderr) {
   tauri::async_runtime::spawn(async move {
     let mut reader = BufReader::new(stderr);
     let mut buf = Vec::new();
-    while let Ok(n) = reader.read_until(b'\n', &mut buf).await {
+    while let Ok(n) = (&mut reader).take(MAX_LOG_LINE).read_until(b'\n', &mut buf).await {
       if n == 0 {
         break;
       }

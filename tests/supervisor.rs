@@ -236,3 +236,23 @@ async fn restart_on_crash_recovers() {
   sup.shutdown().await;
   assert_eq!(sup.status(), Status::Stopped);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_during_restart_backoff_stops() {
+  let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python-sdk/tests/fixtures/echo_app.py");
+  let mut cfg = config(vec![fixture.to_string_lossy().into_owned()]);
+  cfg.restart_on_crash = true;
+  let sup = Supervisor::new(cfg, Arc::new(Recorder::default()));
+  sup.start();
+  let err = sup.call("crash", Payload::None, vec![], CallOptions::default()).await.unwrap_err();
+  assert_eq!(err.code, "runtime_exited");
+  let started = Instant::now();
+  sup.shutdown().await;
+  let elapsed = started.elapsed();
+  assert!(elapsed < Duration::from_secs(2), "shutdown took {elapsed:?}");
+  assert_eq!(sup.status(), Status::Stopped);
+  tokio::time::sleep(Duration::from_millis(1500)).await;
+  assert_eq!(sup.status(), Status::Stopped);
+  let err = sup.call("hello", json_payload(json!({"name": "x"})), vec![], CallOptions::default()).await.unwrap_err();
+  assert_eq!(err.code, "runtime_unavailable");
+}

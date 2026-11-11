@@ -17,6 +17,7 @@ dist-js
 dist
 
 docs/superpowers/
+.superpowers/
 
 pnpm-lock.yaml
 uv.lock

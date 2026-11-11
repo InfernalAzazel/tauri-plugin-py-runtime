@@ -2,6 +2,7 @@ use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 use tauri::{
   command,
+  http::HeaderMap,
   ipc::{Channel, InvokeBody, InvokeResponseBody, JavaScriptChannelId, Request, Response},
   Runtime, State, Webview,
 };
@@ -26,7 +27,18 @@ pub(crate) fn to_response_body(payload: Payload) -> InvokeResponseBody {
   }
 }
 
-fn parse_channels<R: Runtime>(raw: &str, webview: &Webview<R>) -> Result<Vec<(String, ChannelSink)>> {
+fn header(headers: &HeaderMap, name: &str) -> Result<Option<String>> {
+  headers
+    .get(name)
+    .map(|v| {
+      v.to_str()
+        .map(str::to_owned)
+        .map_err(|_| Error::new(codes::INVALID_ARGS, format!("{name} header is not valid visible ASCII")))
+    })
+    .transpose()
+}
+
+fn parse_channel_ids(raw: &str) -> Result<Vec<(String, JavaScriptChannelId)>> {
   let ids: HashMap<String, String> = serde_json::from_str(raw)
     .map_err(|e| Error::new(codes::INVALID_ARGS, format!("invalid {HEADER_CHANNELS} header: {e}")))?;
   ids
@@ -34,6 +46,15 @@ fn parse_channels<R: Runtime>(raw: &str, webview: &Webview<R>) -> Result<Vec<(St
     .map(|(name, id)| {
       let id = JavaScriptChannelId::from_str(&id)
         .map_err(|e| Error::new(codes::INVALID_ARGS, format!("invalid channel '{name}': {e}")))?;
+      Ok((name, id))
+    })
+    .collect()
+}
+
+fn parse_channels<R: Runtime>(raw: &str, webview: &Webview<R>) -> Result<Vec<(String, ChannelSink)>> {
+  parse_channel_ids(raw)?
+    .into_iter()
+    .map(|(name, id)| {
       let channel: Channel<InvokeResponseBody> = id.channel_on(webview.clone());
       let sink: ChannelSink = Arc::new(move |payload| {
         if let Err(e) = channel.send(to_response_body(payload)) {
@@ -52,18 +73,20 @@ pub(crate) async fn invoke<R: Runtime>(
   request: Request<'_>,
 ) -> Result<Response> {
   let headers = request.headers();
-  let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
 
-  let cmd = header(HEADER_CMD)
+  let cmd = header(headers, HEADER_CMD)?
     .ok_or_else(|| Error::new(codes::INVALID_ARGS, format!("missing {HEADER_CMD} header")))?;
-  let timeout = header(HEADER_TIMEOUT)
+  if cmd.is_empty() {
+    return Err(Error::new(codes::INVALID_ARGS, format!("{HEADER_CMD} header is empty")));
+  }
+  let timeout = header(headers, HEADER_TIMEOUT)?
     .map(|v| {
       v.parse::<u64>()
         .map(Duration::from_millis)
-        .map_err(|_| Error::new(codes::INVALID_ARGS, format!("invalid {HEADER_TIMEOUT} header")))
+        .map_err(|_| Error::new(codes::INVALID_ARGS, format!("invalid {HEADER_TIMEOUT} header: '{v}' is not milliseconds")))
     })
     .transpose()?;
-  let channels = match header(HEADER_CHANNELS) {
+  let channels = match header(headers, HEADER_CHANNELS)? {
     Some(raw) => parse_channels(&raw, &webview)?,
     None => Vec::new(),
   };
@@ -73,7 +96,7 @@ pub(crate) async fn invoke<R: Runtime>(
     InvokeBody::Raw(bytes) => Payload::Raw(bytes.clone()),
   };
   let opts = CallOptions {
-    client_id: header(HEADER_CALL_ID),
+    client_id: header(headers, HEADER_CALL_ID)?,
     timeout,
     window: Some(webview.label().to_string()),
   };
@@ -101,4 +124,46 @@ pub(crate) fn emit<R: Runtime>(
 #[command]
 pub(crate) fn status(state: State<'_, PyRuntime>) -> Status {
   state.supervisor().status()
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use tauri::http::HeaderValue;
+
+  #[test]
+  fn parses_valid_channel_ids() {
+    let Ok(mut ids) = parse_channel_ids(r#"{"progress":"__CHANNEL__:12","log":"__CHANNEL__:7"}"#) else {
+      panic!("valid channel ids should parse");
+    };
+    ids.sort_by(|a, b| a.0.cmp(&b.0));
+    let names: Vec<_> = ids.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["log", "progress"]);
+  }
+
+  #[test]
+  fn rejects_invalid_channel_json() {
+    let err = parse_channel_ids("not json").err().expect("should fail");
+    assert_eq!(err.code, codes::INVALID_ARGS);
+    assert!(err.message.contains(HEADER_CHANNELS), "{}", err.message);
+  }
+
+  #[test]
+  fn rejects_channel_id_without_prefix() {
+    let err = parse_channel_ids(r#"{"progress":"12"}"#).err().expect("should fail");
+    assert_eq!(err.code, codes::INVALID_ARGS);
+    assert!(err.message.contains("'progress'"), "{}", err.message);
+  }
+
+  #[test]
+  fn header_distinguishes_missing_from_invalid() {
+    let mut headers = HeaderMap::new();
+    assert_eq!(header(&headers, HEADER_CMD).unwrap(), None);
+    headers.insert(HEADER_CMD, HeaderValue::from_static("greet"));
+    assert_eq!(header(&headers, HEADER_CMD).unwrap().as_deref(), Some("greet"));
+    headers.insert(HEADER_CMD, HeaderValue::from_bytes(b"gr\xffeet").unwrap());
+    let err = header(&headers, HEADER_CMD).unwrap_err();
+    assert_eq!(err.code, codes::INVALID_ARGS);
+    assert!(err.message.contains(HEADER_CMD), "{}", err.message);
+  }
 }

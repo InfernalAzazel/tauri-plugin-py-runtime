@@ -14,6 +14,7 @@ pub mod bridge;
 mod commands;
 mod error;
 mod models;
+pub mod runtime;
 
 pub use error::{Error, Result};
 

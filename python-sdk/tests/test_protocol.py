@@ -76,6 +76,12 @@ def test_encode_payload():
     assert encode_payload(Point(1, 2)) == ("json", b'{"x":1,"y":2}')
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), {"x": [float("-inf")]}])
+def test_encode_payload_rejects_non_finite_floats(value):
+    with pytest.raises(ValueError):
+        encode_payload(value)
+
+
 def test_decode_payload():
     assert decode_payload("json", b'{"a":1}') == {"a": 1}
     assert decode_payload("raw", b"\x01") == Raw(b"\x01")

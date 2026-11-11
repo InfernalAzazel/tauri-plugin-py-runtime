@@ -73,7 +73,9 @@ def _json_default(value: Any) -> Any:
 
 
 def _dumps(value: Any) -> bytes:
-    return json.dumps(value, default=_json_default, ensure_ascii=False, separators=(",", ":")).encode()
+    return json.dumps(
+        value, default=_json_default, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    ).encode()
 
 
 def encode(frame: Frame) -> bytes:

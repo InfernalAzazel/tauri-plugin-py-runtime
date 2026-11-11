@@ -343,6 +343,52 @@ def test_shutdown_budget_parsing():
         assert shutdown_budget({"timeoutMs": bad}) == 3.0
 
 
+def test_nan_result_is_internal_error(harness):
+    app = App(stdio=False)
+
+    @app.command
+    async def nan() -> float:
+        return float("nan")
+
+    h = harness(app)
+    h.request(1, "nan")
+    f = h.recv()
+    assert f.kind == Kind.ERROR
+    assert f.header["code"] == "internal"
+
+
+def test_unserializable_error_data_falls_back(harness, capfd):
+    app = App(stdio=False)
+
+    @app.command
+    async def odd() -> None:
+        raise TauriError("odd", "bad data", {"obj": object()})
+
+    h = harness(app)
+    h.request(1, "odd")
+    f = h.recv()
+    assert f.kind == Kind.ERROR
+    assert f.header == {"id": 1, "code": "odd", "message": "bad data"}
+    assert "[WARN]" in capfd.readouterr().err
+
+
+def test_exited_event_name_is_reserved(harness):
+    app = App(stdio=False)
+    errors = []
+
+    @app.command
+    async def bad() -> None:
+        try:
+            await app.emit("exited", {})
+        except ValueError as e:
+            errors.append(str(e))
+
+    h = harness(app)
+    h.request(1, "bad")
+    h.recv()
+    assert len(errors) == 1 and "exited" in errors[0]
+
+
 def test_truncated_frame_exit_code_2(harness):
     from tauri_runtime.protocol import Frame
 

@@ -105,6 +105,8 @@ class App:
         return decorator
 
     async def emit(self, event: str, payload: Any = None, *, target: str | None = None) -> None:
+        if event in RESERVED_EVENTS:
+            raise ValueError(f"event name '{event}' is reserved by the runtime")
         if self._writer is None:
             raise RuntimeError("app is not running")
         encoding, body = encode_payload(payload)
@@ -347,7 +349,14 @@ class App:
         header: dict[str, Any] = {"id": ctx.id, "code": code, "message": message}
         if data is not None:
             header["data"] = data
-        self._send(Frame(Kind.ERROR, header))
+        try:
+            self._send(Frame(Kind.ERROR, header))
+        except (TypeError, ValueError, FrameTooLarge) as e:
+            if "data" not in header:
+                raise
+            print(f"[WARN] dropped error data for call {ctx.id}: {e}", file=sys.stderr)
+            del header["data"]
+            self._send(Frame(Kind.ERROR, header))
 
     # events -------------------------------------------------------------
 

@@ -45,7 +45,7 @@ function toPyRuntimeError(error: unknown): PyRuntimeError {
   return new PyRuntimeError("internal", String(error));
 }
 
-// Call ids share one table across all webviews on the Rust side, so they must be globally unique.
+// The Rust side rejects a call id that is still pending in the same window, so ids must be unique.
 function newCallId(): string {
   const cryptoApi = globalThis.crypto as Crypto | undefined;
   if (typeof cryptoApi?.randomUUID === "function") return cryptoApi.randomUUID();
@@ -67,9 +67,13 @@ export async function pyInvoke<T = unknown>(
   if (typeof cmd !== "string" || !/^[\x20-\x7e]+$/.test(cmd)) {
     throw new PyRuntimeError("invalid_args", "cmd must be a non-empty printable ASCII string");
   }
+  const { timeoutMs } = options;
+  if (timeoutMs !== undefined && !(Number.isSafeInteger(timeoutMs) && timeoutMs >= 0)) {
+    throw new PyRuntimeError("invalid_args", "timeoutMs must be a non-negative integer");
+  }
   const callId = newCallId();
   const headers: Record<string, string> = { "x-py-cmd": cmd, "x-py-call-id": callId };
-  if (options.timeoutMs !== undefined) headers["x-py-timeout-ms"] = String(options.timeoutMs);
+  if (timeoutMs !== undefined) headers["x-py-timeout-ms"] = String(timeoutMs);
 
   let body: PyArgs = args;
   if (!(args instanceof Uint8Array) && !(args instanceof ArrayBuffer)) {

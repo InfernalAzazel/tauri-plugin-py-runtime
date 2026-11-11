@@ -1,0 +1,162 @@
+# 推送 `v*` 标签时校验版本、运行测试，并发布到 crates.io、npm 与 PyPI，最后创建 GitHub Release。
+# 各发布步骤会跳过已发布的版本，因此失败后可直接重跑。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Tauri 在 Linux 上编译所需的系统库
+  TAURI_LINUX_DEPS: libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
+
+jobs:
+  check:
+    name: Check versions and run tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that every package version matches the tag
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          fail=0
+          check() {
+            if [ "$2" != "$version" ]; then
+              echo "::error file=$1::version '$2' does not match tag $GITHUB_REF_NAME"
+              fail=1
+            fi
+          }
+          check Cargo.toml "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          check package.json "$(node -p 'require("./package.json").version')"
+          check python-sdk/pyproject.toml "$(sed -n 's/^version = "\(.*\)"/\1/p' python-sdk/pyproject.toml | head -1)"
+          check python-sdk/tauri_runtime/protocol.py "$(sed -n 's/^SDK_VERSION = "\(.*\)"/\1/p' python-sdk/tauri_runtime/protocol.py)"
+          exit $fail
+
+      - name: Install Tauri system dependencies
+        run: sudo apt-get update && sudo apt-get install -y $TAURI_LINUX_DEPS
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Python SDK tests
+        working-directory: python-sdk
+        run: uv sync && uv run pytest
+
+      - name: Rust tests
+        run: cargo test
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build frontend API
+        run: npm install
+
+  crates-io:
+    name: Publish to crates.io
+    needs: check
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri system dependencies
+        run: sudo apt-get update && sudo apt-get install -y $TAURI_LINUX_DEPS
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if curl -fsS -A "tauri-plugin-py-runtime release workflow" \
+            "https://crates.io/api/v1/crates/tauri-plugin-py-runtime/$version" >/dev/null 2>&1; then
+            echo "tauri-plugin-py-runtime $version is already on crates.io, skipping"
+            exit 0
+          fi
+          cargo publish
+
+  npm:
+    name: Publish to npm
+    needs: check
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Install and build
+        run: npm install
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if npm view "tauri-plugin-py-runtime-api@$version" version >/dev/null 2>&1; then
+            echo "tauri-plugin-py-runtime-api $version is already on npm, skipping"
+            exit 0
+          fi
+          npm publish --provenance --access public
+
+  # CLI 默认会安装 crates.io 与 npm 上的同版本包，因此 PyPI 最后发布。
+  pypi:
+    name: Publish to PyPI
+    needs: [crates-io, npm]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Build
+        working-directory: python-sdk
+        run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: python-sdk/dist/
+      - name: Publish (trusted publishing)
+        working-directory: python-sdk
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if curl -fsS "https://pypi.org/pypi/tauri-runtime/$version/json" >/dev/null 2>&1; then
+            echo "tauri-runtime $version is already on PyPI, skipping"
+            exit 0
+          fi
+          uv publish --trusted-publishing always
+
+  github-release:
+    name: Create GitHub release
+    needs: pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists, skipping"
+            exit 0
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag

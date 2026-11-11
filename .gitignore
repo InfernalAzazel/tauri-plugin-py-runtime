@@ -17,3 +17,9 @@ dist-js
 dist
 
 docs/superpowers/
+
+pnpm-lock.yaml
+uv.lock
+__pycache__/
+.venv/
+.pytest_cache/

@@ -32,4 +32,4 @@ from .protocol import PROTOCOL_VERSION, SDK_VERSION, Raw
 
 __version__ = SDK_VERSION
 
-__all__ = ["App", "Channel", "Command", "Event", "Raw", "TauriError", "PROTOCOL_VERSION", "SDK_VERSION"]
+__all__ = ["PROTOCOL_VERSION", "SDK_VERSION", "App", "Channel", "Command", "Event", "Raw", "TauriError"]

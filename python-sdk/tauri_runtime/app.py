@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import inspect
 import logging
@@ -14,8 +15,9 @@ import math
 import os
 import sys
 import traceback
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, BinaryIO, Callable, NoReturn
+from typing import Any, BinaryIO, NoReturn
 
 from pydantic.alias_generators import to_snake
 
@@ -42,6 +44,8 @@ LIFECYCLE = ("startup", "ready", "shutdown")
 RESERVED_EVENTS = ("exited",)
 DEFAULT_SHUTDOWN_TIMEOUT_S = 3.0
 
+logger = logging.getLogger(__name__)
+
 
 def shutdown_budget(value: Any) -> float:
     """将 `Shutdown.timeoutMs` 换算为关闭预算（秒）。
@@ -65,7 +69,7 @@ def _exit_code(exc: SystemExit) -> int:
         return 0
     if isinstance(exc.code, int):
         return exc.code
-    print(exc.code, file=sys.stderr)
+    logger.error("[ERROR] %s", exc.code)
     return 1
 
 
@@ -267,14 +271,13 @@ class App:
         except SystemExit as e:
             code = _exit_code(e)
         except BaseException:
-            traceback.print_exc()
+            logger.exception("[ERROR] runtime crashed")
         finally:
             logging.shutdown()
             for stream in (sys.stderr, writer):
-                try:
+                # 管道已断开（OSError）或流已关闭（ValueError）时无处可报，直接忽略。
+                with contextlib.suppress(OSError, ValueError):
                     stream.flush()
-                except Exception:
-                    pass
             # 用 os._exit 跳过解释器退出时对工作线程的 join，卡住的同步处理器不会阻塞退出。
             os._exit(code)
 
@@ -317,7 +320,7 @@ class App:
             try:
                 await self._run_hooks("startup")
             except Exception:
-                traceback.print_exc()
+                logger.exception("[ERROR] startup hook failed")
                 return 1
             self._writer.write(wire.Hello(protocol=PROTOCOL_VERSION, commands=self._router.names()))
             while (frame := await self._next_frame(reader_pool, reader)) is not None:
@@ -326,8 +329,8 @@ class App:
                     break
                 try:
                     self._dispatch(frame)
-                except Exception as e:
-                    print(f"[WARN] dropped {frame.message.type} frame: {e}", file=sys.stderr)
+                except Exception:
+                    logger.warning("[WARN] dropped %s frame", frame.message.type, exc_info=True)
             deadline = self._loop.time() + budget
             await self._stop_tasks(budget)
             await self._run_hooks_logged("shutdown", timeout=max(0.0, deadline - self._loop.time()))
@@ -345,17 +348,17 @@ class App:
             try:
                 return await self._loop.run_in_executor(pool, read_frame, reader)
             except MalformedFrame as e:
-                print(f"[WARN] dropped frame: {e}", file=sys.stderr)
+                logger.warning("[WARN] dropped frame: %s", e)
             except ProtocolError as e:
                 self._protocol_error = True
-                print(f"[WARN] protocol error: {e}", file=sys.stderr)
+                logger.warning("[WARN] protocol error: %s", e)
                 return None
             except OSError as e:
                 self._protocol_error = True
-                print(f"[WARN] read error: {e}", file=sys.stderr)
+                logger.warning("[WARN] read error: %s", e)
                 return None
             except Exception:
-                traceback.print_exc()
+                logger.exception("[ERROR] frame reader crashed")
                 return None
 
     def _dispatch(self, frame: Frame) -> None:
@@ -369,7 +372,7 @@ class App:
             case wire.Event() as event:
                 self._deliver_event(event, frame.body)
             case other:
-                print(f"[WARN] unexpected frame {other.type}", file=sys.stderr)
+                logger.warning("[WARN] unexpected frame %s", other.type)
 
     # 辅助方法 -----------------------------------------------------------
 
@@ -397,7 +400,7 @@ class App:
             try:
                 await self._run_hooks(hook)
             except Exception:
-                traceback.print_exc()
+                logger.exception("[ERROR] %s hook failed", hook)
             return
         # 用 asyncio.wait 而非 wait_for：后者超时后会等待被取消的任务结束，
         # 吞掉 CancelledError 的钩子会借此突破关闭预算。
@@ -405,10 +408,9 @@ class App:
         done, _ = await asyncio.wait({task}, timeout=timeout)
         if not done:
             task.cancel()
-            print(f"[WARN] {hook} hooks timed out", file=sys.stderr)
+            logger.warning("[WARN] %s hooks timed out", hook)
         elif not task.cancelled() and task.exception() is not None:
-            exc = task.exception()
-            traceback.print_exception(type(exc), exc, exc.__traceback__)
+            logger.error("[ERROR] %s hook failed", hook, exc_info=task.exception())
 
     async def _stop_tasks(self, timeout: float) -> None:
         """取消所有在途调用与后台任务，至多等待 `timeout` 秒，忽略取消的任务被放弃。"""
@@ -421,7 +423,7 @@ class App:
             return
         _, still_running = await asyncio.wait(pending, timeout=timeout)
         if still_running:
-            print(f"[WARN] {len(still_running)} task(s) ignored cancellation; abandoning them", file=sys.stderr)
+            logger.warning("[WARN] %d task(s) ignored cancellation; abandoning them", len(still_running))
 
     # 调用 ---------------------------------------------------------------
 
@@ -466,6 +468,7 @@ class App:
         except FrameTooLarge as e:
             self._send_error(ctx, "frame_too_large", str(e))
         except Exception as e:
+            logger.exception("[ERROR] command %r failed", ctx.cmd)
             data: dict[str, Any] = {"type": type(e).__name__}
             if os.environ.get("TAURI_RUNTIME_DEBUG") == "1":
                 data["traceback"] = traceback.format_exc()
@@ -506,7 +509,7 @@ class App:
         except (ValueError, FrameTooLarge) as e:
             if data is None:
                 raise
-            print(f"[WARN] dropped error data for call {ctx.id}: {e}", file=sys.stderr)
+            logger.warning("[WARN] dropped error data for call %d: %s", ctx.id, e)
             self._send(error.model_copy(update={"data": None}))
 
     # 事件 ---------------------------------------------------------------
@@ -516,7 +519,7 @@ class App:
         try:
             payload = join_payload(message, body)
         except ProtocolError as e:
-            print(f"[WARN] dropped event frame: {e}", file=sys.stderr)
+            logger.warning("[WARN] dropped event frame: %s", e)
             return
         event = Event(message.event, payload, message.window)
         for func in self._events.get(event.name):
@@ -526,4 +529,4 @@ class App:
         try:
             await self._invoke(func, event)
         except Exception:
-            traceback.print_exc()
+            logger.exception("[ERROR] listener for event %r failed", event.name)

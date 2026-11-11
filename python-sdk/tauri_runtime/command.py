@@ -11,8 +11,9 @@ from __future__ import annotations
 import inspect
 import json
 import typing
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 from pydantic.alias_generators import to_camel

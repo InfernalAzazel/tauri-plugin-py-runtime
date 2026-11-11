@@ -339,7 +339,7 @@ def test_nan_result_is_internal_error(harness):
     assert h.recv().message.code == "internal"
 
 
-def test_unserializable_error_data_falls_back(harness, capfd):
+def test_unserializable_error_data_falls_back(harness, caplog):
     app = App(stdio=False)
 
     @app.command
@@ -349,7 +349,7 @@ def test_unserializable_error_data_falls_back(harness, capfd):
     h = harness(app)
     h.request(1, "odd")
     assert h.recv().message == wire.Error(id=1, code="odd", message="bad data")
-    assert "[WARN]" in capfd.readouterr().err
+    assert any(r.levelname == "WARNING" and "dropped error data" in r.message for r in caplog.records)
 
 
 def test_exited_event_name_is_reserved(harness):

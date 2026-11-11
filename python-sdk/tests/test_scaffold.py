@@ -31,6 +31,12 @@ pub fn run() {
 }
 """
 
+BUILD_RS = """\
+fn main() {
+    tauri_build::build()
+}
+"""
+
 
 def test_patch_tauri_conf_appends_build_step_and_resources():
     text, hints = scaffold.patch_tauri_conf(TAURI_CONF)
@@ -78,6 +84,16 @@ def test_patch_lib_rs_rejects_unrecognized_code():
     assert scaffold.patch_lib_rs("fn main() {}\n") is None
     assert scaffold.patch_lib_rs(LIB_RS + LIB_RS) is None
     assert scaffold.patch_lib_rs("let b = tauri::Builder::default();\n") is None
+
+
+def test_patch_build_rs_creates_bundle_dir_first():
+    text = scaffold.patch_build_rs(BUILD_RS)
+    assert text is not None
+    lines = text.splitlines()
+    assert lines[2].startswith('    std::fs::create_dir_all("../src-python/dist/py-backend")')
+    assert lines[3] == "    tauri_build::build()"
+    assert scaffold.patch_build_rs(text) == text
+    assert scaffold.patch_build_rs("fn main() {}\n") is None
 
 
 def test_detect_package_manager(tmp_path):
@@ -140,6 +156,7 @@ def make_tauri_project(root: Path) -> Path:
     (root / "src-tauri" / "tauri.conf.json").write_text(TAURI_CONF)
     (root / "src-tauri" / "capabilities" / "default.json").write_text(json.dumps({"permissions": ["core:default"]}))
     (root / "src-tauri" / "src" / "lib.rs").write_text(LIB_RS)
+    (root / "src-tauri" / "build.rs").write_text(BUILD_RS)
     (root / "package.json").write_text("{}")
     return root
 
@@ -176,6 +193,7 @@ def test_init_sets_up_project(tmp_path):
     assert run.calls[0][1] == project / "src-python"
     assert (project / "src-python" / "main.py").read_text() == templates.MAIN_PY
     assert "tauri_plugin_py_runtime" in (project / "src-tauri" / "src" / "lib.rs").read_text()
+    assert templates.BUNDLE_DIR in (project / "src-tauri" / "build.rs").read_text()
     capability = json.loads((project / "src-tauri" / "capabilities" / "default.json").read_text())
     assert "py-runtime:default" in capability["permissions"]
     conf = json.loads((project / "src-tauri" / "tauri.conf.json").read_text())

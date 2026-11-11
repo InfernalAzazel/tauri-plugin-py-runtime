@@ -13,6 +13,47 @@ The Rust side and Python talk over the child process's stdin/stdout using a smal
 length-prefixed protocol of JSON messages (protocol version 2, frames up to 64 MiB, see
 [Protocol](#protocol)).
 
+## Getting started
+
+The `tauri-runtime` CLI sets everything up. It needs [uv](https://docs.astral.sh/uv/), Cargo
+and Node.js. Create a new app:
+
+```bash
+uvx --from tauri-runtime tauri-runtime create my-app --template vue-ts --manager pnpm
+```
+
+Or add a Python backend to an existing Tauri project (run in the directory containing `src-tauri`):
+
+```bash
+uvx --from tauri-runtime tauri-runtime init
+```
+
+`create` runs `create-tauri-app` and then `init`. `init`:
+
+- creates `src-python/` (`pyproject.toml` depending on `tauri-runtime` with Nuitka as a dev
+  dependency, a `main.py` with a `greet` command, `.gitignore`) and runs `uv sync`;
+- adds the Rust crate (`cargo add`) and the frontend package (pnpm / yarn / bun / npm, detected
+  from the lockfile or `beforeDevCommand`);
+- registers the plugin after `tauri::Builder::default()` in `src-tauri/src/lib.rs`, adds
+  `py-runtime:default` to `capabilities/default.json`, and wires up
+  [Packaging with Nuitka](#packaging-with-nuitka) in `tauri.conf.json` and `build.rs`.
+
+Steps it can't apply safely (an unusual `lib.rs`, `Tauri.toml`, list-form `bundle.resources`, ...)
+are printed for you to do by hand. Re-running is safe: files already set up are left alone, and
+`--force` continues when `src-python` exists without overwriting its files.
+
+Pass `--git` to install all three packages from GitHub, or `--path <checkout>` to use a local
+clone of this repository (build its frontend package first with `pnpm install && pnpm build`).
+
+Then `pnpm tauri dev` runs `src-python/main.py` with `src-python/.venv`, and
+`pnpm tauri build` ships the Nuitka-packaged backend:
+
+```ts
+import { pyInvoke } from "tauri-plugin-py-runtime-api";
+
+const message = await pyInvoke<string>("greet", { name: "Tauri" });
+```
+
 ## Python
 
 ```python
@@ -225,6 +266,16 @@ user's machine needs no Python. Debug builds keep running the script; release bu
      "bundle": {
        "resources": { "../src-python/dist/py-backend/": "py-backend/" }
      }
+   }
+   ```
+
+   tauri-build checks that resource paths exist even for `tauri dev`, so create the folder in
+   `src-tauri/build.rs` before it is first built:
+
+   ```rust
+   fn main() {
+       std::fs::create_dir_all("../src-python/dist/py-backend").expect("failed to create the Python bundle directory");
+       tauri_build::build()
    }
    ```
 

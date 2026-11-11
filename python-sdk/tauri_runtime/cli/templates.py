@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 
 REPO_URL = "https://github.com/InfernalAzazel/tauri-plugin-py-runtime"
 BUNDLE_NAME = "py-backend"
+BUNDLE_DIR = f"../src-python/dist/{BUNDLE_NAME}"
 
 MAIN_PY = '''\
 from tauri_runtime import App
@@ -47,6 +48,15 @@ def rust_snippet(indent: str = "") -> str:
         f'        .bundle("{BUNDLE_NAME}")',
         "        .build(),",
         ")",
+    ]
+    return "".join(f"{indent}{line}\n" for line in lines)
+
+
+def build_rs_snippet(indent: str = "") -> str:
+    """`build.rs` 中创建 Nuitka 产物目录的语句，供 tauri-build 校验 `bundle.resources`。"""
+    lines = [
+        "// tauri-build 要求 bundle.resources 的路径存在；Nuitka 产物由 `tauri-runtime build` 生成。",
+        f'std::fs::create_dir_all("{BUNDLE_DIR}").expect("failed to create the Python bundle directory");',
     ]
     return "".join(f"{indent}{line}\n" for line in lines)
 

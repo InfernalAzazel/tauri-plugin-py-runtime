@@ -15,10 +15,12 @@ from typing import Any, Literal
 
 from ..protocol import SDK_VERSION
 from .templates import (
+    BUNDLE_DIR,
     BUNDLE_NAME,
     GITIGNORE,
     MAIN_PY,
     REPO_URL,
+    build_rs_snippet,
     pyproject_toml,
     rust_snippet,
 )
@@ -29,10 +31,11 @@ CRATE = "tauri-plugin-py-runtime"
 NPM_PACKAGE = "tauri-plugin-py-runtime-api"
 GITHUB_SPEC = "github:InfernalAzazel/tauri-plugin-py-runtime"
 BUILD_STEP = "cd src-python && uv run tauri-runtime build"
-RESOURCE_SRC = f"../src-python/dist/{BUNDLE_NAME}/"
+RESOURCE_SRC = f"{BUNDLE_DIR}/"
 RESOURCE_DST = f"{BUNDLE_NAME}/"
 PERMISSION = "py-runtime:default"
 BUILDER_CALL = "tauri::Builder::default()"
+BUILD_CALL = "tauri_build::build()"
 MANAGERS = ("pnpm", "yarn", "bun", "npm")
 LOCKFILES = (
     ("pnpm-lock.yaml", "pnpm"),
@@ -118,6 +121,26 @@ def patch_lib_rs(text: str) -> str | None:
     return None
 
 
+def patch_build_rs(text: str) -> str | None:
+    """在唯一的 `tauri_build::build()` 前创建 Nuitka 产物目录。
+
+    tauri-build 在 dev / check 时也要求 `bundle.resources` 路径存在，而产物只在打包时生成。
+    已处理时原样返回；无法识别时返回 None。
+    """
+    if BUNDLE_DIR in text:
+        return text
+    if text.count(BUILD_CALL) != 1:
+        return None
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if BUILD_CALL in line:
+            if line.strip() != BUILD_CALL:
+                return None
+            lines.insert(index, build_rs_snippet(line[: len(line) - len(line.lstrip())]))
+            return "".join(lines)
+    return None
+
+
 def detect_package_manager(root: Path) -> str:
     """依据锁文件判断前端包管理器；没有锁文件时看 `beforeDevCommand` 的首个单词，默认 npm。"""
     for lockfile, manager in LOCKFILES:
@@ -174,7 +197,7 @@ def check_source(source: Source) -> None:
 
 def run_step(run: Runner, cmd: Sequence[str], cwd: Path) -> None:
     """执行外部命令，失败时抛出 ScaffoldError；经 `shutil.which` 解析以支持 Windows 的 `.cmd`。"""
-    print(f"tauri-runtime: $ {' '.join(cmd)}")
+    print(f"tauri-runtime: $ {' '.join(cmd)}", flush=True)
     program = shutil.which(cmd[0])
     if program is None:
         raise ScaffoldError(f"`{cmd[0]}` not found on PATH")
@@ -253,6 +276,13 @@ def init(
         hints.append(f"register the plugin on your tauri::Builder:\n{rust_snippet('    ')}")
     else:
         patch_file(lib_rs, lambda _: patched)
+
+    build_rs = tauri_dir / "build.rs"
+    patched = patch_build_rs(build_rs.read_text(encoding="utf-8")) if build_rs.is_file() else None
+    if patched is None:
+        hints.append(f"create the Python bundle directory before tauri_build::build() in build.rs:\n{build_rs_snippet('    ')}")
+    else:
+        patch_file(build_rs, lambda _: patched)
     return hints
 
 

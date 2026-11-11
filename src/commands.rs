@@ -1,3 +1,11 @@
+//! 插件暴露给前端的 Tauri 命令：`invoke`、`cancel`、`emit`、`status`。
+//!
+//! 架构位置：前端 -> **Tauri 命令** -> Bridge -> Writer/FrameCodec -> Python 进程。
+//! 本模块只负责把 IPC 请求转换为 [`crate::runtime::Supervisor`] 调用，不保存状态。
+//!
+//! `invoke` 使用原始 IPC 请求：参数体原样作为载荷（JSON 或二进制），调用元数据放在 `x-py-*`
+//! 请求头中，以便二进制参数无需 base64 编码。所有命令都以调用方 webview 的标签作为窗口标识。
+
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 use tauri::{
@@ -14,11 +22,16 @@ use crate::{
   PyRuntime,
 };
 
+/// Python 命令名，必填且非空。
 const HEADER_CMD: &str = "x-py-cmd";
+/// 前端生成的调用 id，可选，用于取消。
 const HEADER_CALL_ID: &str = "x-py-call-id";
+/// 本次调用的超时毫秒数，可选。
 const HEADER_TIMEOUT: &str = "x-py-timeout-ms";
+/// 参数名 → `JavaScriptChannelId` 的 JSON 对象，可选。
 const HEADER_CHANNELS: &str = "x-py-channels";
 
+/// 把载荷转换为 IPC 响应体：无载荷为 JSON `null`，二进制载荷原样返回。
 pub(crate) fn to_response_body(payload: Payload) -> InvokeResponseBody {
   match payload {
     Payload::None => InvokeResponseBody::Json("null".into()),
@@ -27,6 +40,7 @@ pub(crate) fn to_response_body(payload: Payload) -> InvokeResponseBody {
   }
 }
 
+/// 读取可选的请求头；区分“缺失”（`Ok(None)`）与“不是可见 ASCII”（`invalid_args`）。
 fn header(headers: &HeaderMap, name: &str) -> Result<Option<String>> {
   headers
     .get(name)
@@ -38,6 +52,7 @@ fn header(headers: &HeaderMap, name: &str) -> Result<Option<String>> {
     .transpose()
 }
 
+/// 解析 `x-py-channels` 请求头；JSON 或任一 channel id 非法时返回 `invalid_args`。
 fn parse_channel_ids(raw: &str) -> Result<Vec<(String, JavaScriptChannelId)>> {
   let ids: HashMap<String, String> = serde_json::from_str(raw)
     .map_err(|e| Error::new(codes::INVALID_ARGS, format!("invalid {HEADER_CHANNELS} header: {e}")))?;
@@ -51,6 +66,9 @@ fn parse_channel_ids(raw: &str) -> Result<Vec<(String, JavaScriptChannelId)>> {
     .collect()
 }
 
+/// 把前端 channel id 绑定到调用方 webview，得到转发载荷的 [`ChannelSink`]。
+///
+/// 投递失败只记录警告：channel 数据是尽力而为的，不应让 Python 侧的调用失败。
 fn parse_channels<R: Runtime>(raw: &str, webview: &Webview<R>) -> Result<Vec<(String, ChannelSink)>> {
   parse_channel_ids(raw)?
     .into_iter()
@@ -66,6 +84,13 @@ fn parse_channels<R: Runtime>(raw: &str, webview: &Webview<R>) -> Result<Vec<(St
     .collect()
 }
 
+/// 前端 `pyInvoke` 对应的命令：调用 Python 命令并返回其结果。
+///
+/// 请求体为 JSON 时作为 JSON 参数（`null` 视为无参数），为二进制时作为原始字节参数。
+///
+/// # Errors
+///
+/// 请求头缺失或非法时返回 `invalid_args`，其余错误见 [`crate::runtime::Supervisor::call`]。
 #[command]
 pub(crate) async fn invoke<R: Runtime>(
   webview: Webview<R>,
@@ -105,11 +130,17 @@ pub(crate) async fn invoke<R: Runtime>(
   Ok(Response::new(to_response_body(result)))
 }
 
+/// 取消调用方 webview 中客户端 id 为 `id` 的调用，返回是否找到该调用。
 #[command]
 pub(crate) fn cancel<R: Runtime>(webview: Webview<R>, state: State<'_, PyRuntime>, id: String) -> bool {
   state.supervisor().cancel(webview.label(), &id)
 }
 
+/// 前端 `pyEmit` 对应的命令：向 Python 发送事件，`window` 为调用方 webview 标签。
+///
+/// # Errors
+///
+/// Python 未运行时返回 `runtime_unavailable`，事件帧过大时返回 `frame_too_large`。
 #[command]
 pub(crate) fn emit<R: Runtime>(
   webview: Webview<R>,
@@ -121,6 +152,7 @@ pub(crate) fn emit<R: Runtime>(
   state.supervisor().emit(&event, payload, Some(webview.label()))
 }
 
+/// 前端 `pyStatus` 对应的命令：返回运行时当前状态。
 #[command]
 pub(crate) fn status(state: State<'_, PyRuntime>) -> Status {
   state.supervisor().status()

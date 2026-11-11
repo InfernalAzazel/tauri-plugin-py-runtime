@@ -1,3 +1,8 @@
+//! [`Supervisor`] 的端到端集成测试：启动真实的 Python 进程（`python-sdk/tests/fixtures/echo_app.py`
+//! 或内联脚本），覆盖调用、错误、超时与取消、channel、事件、崩溃重启和关闭等行为。
+//!
+//! 需要可导入 `tauri_runtime` 的解释器，默认使用 `python-sdk` 下 `uv sync` 创建的虚拟环境。
+
 use std::{
   path::PathBuf,
   sync::{Arc, Mutex},
@@ -25,7 +30,7 @@ impl EventSink for Recorder {
   }
 }
 
-/// `$PYTHON`, else the python-sdk venv (`uv sync`), which has the SDK's dependencies.
+/// 优先使用 `$PYTHON`，否则使用已安装 SDK 依赖的 python-sdk 虚拟环境（`uv sync`），最后回退到系统解释器。
 fn python() -> PathBuf {
   if let Ok(python) = std::env::var("PYTHON") {
     return python.into();
@@ -213,7 +218,7 @@ sys.stdin.read()\n";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn undecodable_handshake_is_protocol_mismatch() {
-  // A protocol 1 Hello: kind byte 0x01, then the header length and header.
+  // 协议 v1 的 Hello 帧：类型字节 0x01，随后是头长度和头。
   let script = "import sys\n\
 header = b'{\"protocol\":1}'\n\
 frame = b'\\x01' + len(header).to_bytes(4, 'big') + header\n\

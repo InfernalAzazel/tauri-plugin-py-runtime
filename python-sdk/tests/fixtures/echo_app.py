@@ -1,3 +1,6 @@
+"""端到端测试用的示例后端：以子进程方式运行，覆盖 JSON / 二进制、取消、自定义错误、通道、
+进程崩溃、stderr 非 UTF-8 输出和事件往返等场景。"""
+
 import asyncio
 import os
 import sys

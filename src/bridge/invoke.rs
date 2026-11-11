@@ -1,3 +1,15 @@
+//! 调用路由：把前端调用转换为 `request` 帧，并把 Python 返回的帧分发回对应的等待者。
+//!
+//! 架构位置：前端 -> Tauri 命令 -> **Bridge** -> Writer/FrameCodec -> Python 进程。
+//! [`Bridge`] 不持有连接：发送通过调用方传入的 [`Writer`]，接收由
+//! [`crate::runtime::Supervisor`] 的读循环调用 [`Bridge::handle`]。
+//!
+//! 不变量：
+//! - 每个调用 id 只会被完成一次（响应、错误、超时、取消或 [`Bridge::fail_all`] 中先到者生效），
+//!   之后迟到的帧被静默丢弃；
+//! - 调用完成时同时注销其 channel 与客户端 id 映射，因此调用返回后到达的 `channel_data` 不会再投递；
+//! - 客户端调用 id 按窗口隔离，见 [`CallOptions::client_id`]。
+
 use std::{
   collections::{BTreeMap, HashMap},
   sync::{
@@ -17,24 +29,39 @@ use crate::{
   error::{codes, Error, Result},
 };
 
+/// 接收某个 channel 数据的回调，通常把载荷转发给前端的 `Channel`。
+///
+/// 在 Python 读循环中同步调用，不应阻塞。
 pub type ChannelSink = Arc<dyn Fn(Payload) + Send + Sync>;
 
+/// 接收 Python 发往前端的事件与进程退出通知。
+///
+/// 插件内的实现把事件转发为 Tauri 事件 `py://<event>`；测试中可替换为记录器。
 pub trait EventSink: Send + Sync + 'static {
+  /// 转发 Python 发出的事件；`target` 为目标 webview 标签，`None` 表示广播。
   fn emit(&self, event: &str, target: Option<&str>, payload: Payload);
+  /// 通知 Python 进程意外退出，`code` 为退出码（被信号终止时为 `None`）。
   fn exited(&self, code: Option<i32>);
 }
 
+/// 单次调用的可选参数。
 #[derive(Debug, Clone, Default)]
 pub struct CallOptions {
+  /// 前端生成的调用 id，用于 [`Bridge::cancel`]。
+  ///
+  /// 以 `(窗口标签, client_id)` 为键，因此不同窗口可以使用相同 id，且一个 webview 只能取消
+  /// 自己发起的调用；同一窗口内仍在进行的 id 不能重复使用。
   pub client_id: Option<String>,
+  /// 本次调用的超时时间；为 `None` 时使用默认超时，指定值最多为默认超时的 [`MAX_TIMEOUT_FACTOR`] 倍。
   pub timeout: Option<Duration>,
+  /// 发起调用的 webview 标签，会随 `request` 帧传给 Python（`Command.window`）。
   pub window: Option<String>,
 }
 
-/// Per-call timeouts from the frontend are capped at this multiple of the default.
+/// 前端指定的单次超时最多为默认超时的此倍数。
 pub const MAX_TIMEOUT_FACTOR: u32 = 10;
 
-/// Client call ids are scoped per window: `(window label, client id)`.
+/// 客户端调用 id 按窗口隔离：`(窗口标签, 客户端 id)`。
 type ClientKey = (String, String);
 
 struct Pending {
@@ -43,6 +70,9 @@ struct Pending {
   client: Option<ClientKey>,
 }
 
+/// 进行中调用、客户端 id 与 channel 的注册表，在多次进程重启之间复用。
+///
+/// 内部使用多把互斥锁，任何时刻最多持有其中一把，且锁内不会调用外部回调。
 #[derive(Default)]
 pub struct Bridge {
   next_id: AtomicU64,
@@ -57,10 +87,27 @@ fn cancel_frame(id: u64, reason: &str) -> Frame {
 }
 
 impl Bridge {
+  /// 创建空的注册表。
   pub fn new() -> Self {
     Self::default()
   }
 
+  /// 通过 `writer` 发送一次命令调用，并等待 Python 的响应。
+  ///
+  /// `channels` 中的每个回调会分配一个新的 channel id，随请求以“参数名 → channel id”发送，
+  /// 调用结束后即注销。超时时间为 `opts.timeout`（上限为 `default_timeout` 的
+  /// [`MAX_TIMEOUT_FACTOR`] 倍）或 `default_timeout`；超时后会向 Python 发送
+  /// `reason: "timeout"` 的 `cancel` 帧。
+  ///
+  /// # Errors
+  ///
+  /// - `invalid_args`：同一窗口内该客户端调用 id 仍在进行中；
+  /// - `frame_too_large` / `runtime_unavailable`：请求帧无法发送（见 [`Writer::send`]）；
+  /// - `timeout`：超过超时时间；
+  /// - `cancelled`：被 [`Bridge::cancel`] 取消；
+  /// - `runtime_exited` 等：被 [`Bridge::fail_all`] 以指定错误码终止；
+  /// - Python 返回的错误（如 `command_not_found`、`invalid_args`、`internal` 或自定义错误码），
+  ///   以及响应载荷不一致时的 `internal`。
   pub async fn call(
     &self,
     writer: &Writer,
@@ -114,6 +161,7 @@ impl Bridge {
       Ok(Ok(result)) => result,
       Ok(Err(_)) => Err(Error::new(codes::RUNTIME_EXITED, "python runtime exited")),
       Err(_) => {
+        // 超时与响应可能同时到达：只有成功注销调用的一方才发送 cancel，避免取消已完成的调用。
         if self.finish(id).is_some() {
           let _ = writer.send(cancel_frame(id, "timeout"));
         }
@@ -125,10 +173,12 @@ impl Bridge {
     }
   }
 
+  /// 注销调用及其 channel 与客户端 id 映射；返回 `None` 表示该调用已被其他路径完成。
   fn finish(&self, id: u64) -> Option<Pending> {
     let pending = self.pending.lock().unwrap().remove(&id)?;
     if let Some(key) = &pending.client {
       let mut clients = self.clients.lock().unwrap();
+      // 该客户端 id 可能已被同窗口的新调用重新占用，只移除仍指向本调用的映射。
       if clients.get(key) == Some(&id) {
         clients.remove(key);
       }
@@ -140,6 +190,10 @@ impl Bridge {
     Some(pending)
   }
 
+  /// 取消 `window` 窗口中客户端 id 为 `client_id` 的进行中调用。
+  ///
+  /// 等待者立即以 `cancelled` 失败，不等待 Python 确认；若提供了 `writer`，还会向 Python 发送
+  /// `reason: "client"` 的 `cancel` 帧（发送失败被忽略）。返回是否找到并取消了该调用。
   pub fn cancel(&self, writer: Option<&Writer>, window: &str, client_id: &str) -> bool {
     let key = (window.to_string(), client_id.to_string());
     let id = { self.clients.lock().unwrap().get(&key).copied() };
@@ -152,6 +206,10 @@ impl Bridge {
     true
   }
 
+  /// 处理一帧来自 Python 的消息：完成对应调用、转发事件或投递 channel 数据。
+  ///
+  /// 未知调用 id 或 channel 的帧被静默丢弃；载荷不一致或方向错误的帧记录警告后丢弃，
+  /// 不影响连接。
   pub fn handle(&self, frame: Frame, sink: &dyn EventSink) {
     if let Err(e) = self.dispatch(frame, sink) {
       log::warn!(target: "py-runtime", "dropped frame from python: {e}");
@@ -187,6 +245,9 @@ impl Bridge {
     Ok(())
   }
 
+  /// 以给定错误码终止所有进行中的调用，并清空客户端 id 与 channel 注册表。
+  ///
+  /// 在 Python 进程退出、停止或启动失败时调用。
   pub fn fail_all(&self, code: &str, message: &str) {
     let drained: Vec<Pending> = self.pending.lock().unwrap().drain().map(|(_, p)| p).collect();
     self.clients.lock().unwrap().clear();
@@ -229,7 +290,7 @@ mod tests {
     })
   }
 
-  /// Next frame sent to python, with its message as JSON.
+  /// 读取下一帧发往 Python 的消息，并转为 JSON。
   async fn recv(rx: &mut UnboundedReceiver<Bytes>) -> Value {
     let frame = Frame::decode(&rx.recv().await.unwrap()).unwrap();
     serde_json::to_value(frame.message).unwrap()

@@ -1,3 +1,10 @@
+//! 发往 Python 的帧发送端。
+//!
+//! 架构位置：前端 -> Tauri 命令 -> Bridge -> **Writer**/FrameCodec -> Python 进程（stdin）。
+//!
+//! 不变量：每个 Python 进程只有一个写任务独占其 stdin，所有帧都经由同一个队列串行写出，
+//! 因此并发调用的帧不会交错。帧在入队前完成编码并检查大小，超限帧不会进入队列。
+
 use bytes::Bytes;
 use futures_util::SinkExt;
 use tokio::{io::AsyncWrite, sync::mpsc};
@@ -8,8 +15,10 @@ use crate::{
   error::{codes, Error, Result},
 };
 
-/// Single-writer handle: every frame goes through one task so frames never interleave. Frames
-/// are encoded by [`Writer::send`], so oversized frames are rejected before they are queued.
+/// 单写者句柄：可廉价克隆，所有克隆共享同一个写任务。
+///
+/// 帧由 [`Writer::send`] 编码，因此超限帧在入队前即被拒绝。队列无界、不提供背压；
+/// 写任务因 I/O 错误退出或接收端被丢弃后，后续发送返回 `runtime_unavailable`。
 #[derive(Clone)]
 pub struct Writer {
   tx: mpsc::UnboundedSender<Bytes>,
@@ -17,11 +26,17 @@ pub struct Writer {
 }
 
 impl Writer {
+  /// 创建一个不绑定 I/O 的写句柄及其接收端，接收端得到的是不含外层长度前缀的帧数据。
+  ///
+  /// 主要用于测试，或由调用方自行驱动写出；生产环境使用 [`Writer::spawn`]。
   pub fn channel(max_frame_size: usize) -> (Self, mpsc::UnboundedReceiver<Bytes>) {
     let (tx, rx) = mpsc::unbounded_channel();
     (Self { tx, max_frame_size }, rx)
   }
 
+  /// 启动后台写任务，把帧加上 u32 大端长度前缀后依次写入 `stream`。
+  ///
+  /// 写入失败时记录错误并结束写任务，此后所有 [`Writer::send`] 都会失败。
   pub fn spawn<W: AsyncWrite + Unpin + Send + 'static>(stream: W, max_frame_size: usize) -> Self {
     let (writer, mut rx) = Self::channel(max_frame_size);
     tauri::async_runtime::spawn(async move {
@@ -36,6 +51,12 @@ impl Writer {
     writer
   }
 
+  /// 编码并排队发送一帧，不等待实际写出。
+  ///
+  /// # Errors
+  ///
+  /// - `frame_too_large`：编码后的帧超过 `max_frame_size`；
+  /// - `runtime_unavailable`：写任务已结束（Python 进程已退出或连接已关闭）。
   pub fn send(&self, frame: Frame) -> Result<()> {
     let data = frame.encode();
     if data.len() > self.max_frame_size {

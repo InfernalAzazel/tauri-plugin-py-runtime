@@ -1,3 +1,19 @@
+//! v2 帧协议：消息类型、帧编解码与载荷表示。
+//!
+//! 架构位置：前端 -> Tauri 命令 -> Bridge -> Writer/**FrameCodec** -> Python 进程。
+//! 本模块只描述线上格式，不涉及调用状态。Python 端对应 `tauri_runtime.protocol` 中的 pydantic
+//! 模型，两端以 `python-sdk/tests/fixtures/golden_frames.json` 逐字节对齐。
+//!
+//! 线上格式：`[u32 BE 内层长度][u32 BE 头长度][头 JSON][body]`。
+//!
+//! - 外层长度只计其后的字节，上限为 `max_frame_size`（默认 [`DEFAULT_MAX_FRAME_SIZE`]）；
+//! - 头是以 `type` 字段区分的 JSON 对象（见 [`Message`]），未知字段被忽略；
+//! - JSON 载荷内联在头的 `value` 字段，二进制载荷放在 body 并在头中标记 `raw: true`；
+//!   未设置 `raw` 时 body 必须为空（见 [`Inline::join`]）。
+//!
+//! 不变量：头无法解码的帧只影响该帧本身，可以跳过；超限帧意味着对端异常，按致命错误处理
+//! （见 [`FrameCodec`]）。
+
 use std::collections::BTreeMap;
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -7,15 +23,21 @@ use tokio_util::codec::{Decoder, LengthDelimitedCodec, LengthDelimitedCodecError
 
 use crate::error::{codes, Error};
 
+/// 当前协议版本，握手时 `hello.protocol` 必须与之相等，否则启动失败并返回 `protocol_mismatch`。
 pub const PROTOCOL_VERSION: u64 = 2;
+/// 默认的单帧大小上限（64 MiB），按外层长度前缀之后的字节数计算。
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 
+/// 帧编解码过程中的错误。
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
+  /// 底层 I/O 错误，包括 EOF 时帧不完整；对连接而言是致命的。
   #[error("io error: {0}")]
   Io(#[from] std::io::Error),
+  /// 长度前缀超过上限（携带该上限）；对连接而言是致命的。
   #[error("frame exceeds limit of {0} bytes")]
   TooLarge(usize),
+  /// 帧完整但内容非法（头 JSON 错误、未知 `type`、字段缺失或类型错误、载荷不一致），可跳过。
   #[error("malformed frame: {0}")]
   Malformed(String),
 }
@@ -29,28 +51,36 @@ impl From<ProtocolError> for Error {
   }
 }
 
+/// `ready` 消息中携带的宿主应用信息，取自 Tauri 的 `PackageInfo`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppInfo {
+  /// 应用名称。
   pub name: String,
+  /// 应用版本号。
   pub version: String,
 }
 
-/// Payload fields of a message: a JSON payload travels inline as `value`, a binary payload in
-/// the frame body flagged with `raw: true`.
+/// 消息头中的载荷字段：JSON 载荷内联为 `value`，二进制载荷放在帧 body 中并以 `raw: true` 标记。
+///
+/// 两个字段均为默认值时不会出现在序列化结果中；与 body 组合成 [`Payload`] 见 [`Inline::join`]。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Inline {
+  /// 内联的 JSON 载荷；缺省表示无载荷（`null`）。
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub value: Option<Value>,
+  /// 为 `true` 时载荷是帧 body 中的原始字节，此时 `value` 必须缺省。
   #[serde(default, skip_serializing_if = "std::ops::Not::not")]
   pub raw: bool,
 }
 
-/// The frame header. Field order is the wire order and matches the Python models; unknown
-/// fields are ignored.
+/// 帧头，即以 `type` 字段区分的 JSON 对象。
+///
+/// 字段声明顺序即线上顺序，与 Python 模型一致（golden frames 依赖于此）；反序列化时忽略未知字段。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, strum::IntoStaticStr)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum Message {
+  /// Python → Rust：握手首帧，声明协议版本、SDK 版本与已注册的命令。
   Hello {
     protocol: u64,
     #[serde(default)]
@@ -58,30 +88,37 @@ pub enum Message {
     #[serde(default)]
     commands: Vec<String>,
   },
+  /// Rust → Python：确认握手，Python 收到后执行 `ready` 钩子。
   Ready {
     protocol: u64,
     app: AppInfo,
   },
+  /// Rust → Python：请求退出，`timeoutMs` 是 Python 取消调用并执行 `shutdown` 钩子的总预算。
   Shutdown {
     #[serde(rename = "timeoutMs")]
     timeout_ms: u64,
   },
+  /// Rust → Python：命令调用请求。
   Request {
+    /// Rust 侧分配的调用 id，在单个 [`crate::bridge::Bridge`] 内唯一。
     id: u64,
     cmd: String,
-    /// Argument name → channel id.
+    /// 参数名 → channel id。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     channels: BTreeMap<String, u64>,
+    /// 发起调用的 webview 标签。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window: Option<String>,
     #[serde(flatten)]
     payload: Inline,
   },
+  /// Python → Rust：调用成功的结果。
   Response {
     id: u64,
     #[serde(flatten)]
     payload: Inline,
   },
+  /// Python → Rust：调用失败；缺省的 `code` 按 `internal` 处理。
   Error {
     id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,39 +128,48 @@ pub enum Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     data: Option<Value>,
   },
+  /// Rust → Python：取消调用，`reason` 为 `"client"` 或 `"timeout"`。
   Cancel {
     id: u64,
     reason: String,
   },
-  /// Python → Rust events carry `target`, Rust → Python events carry `window`.
+  /// 双向事件。Python → Rust 的事件携带 `target`，Rust → Python 的事件携带 `window`。
   Event {
     event: String,
+    /// 目标 webview 标签；缺省时广播。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     target: Option<String>,
+    /// 发送事件的 webview 标签。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window: Option<String>,
     #[serde(flatten)]
     payload: Inline,
   },
+  /// Python → Rust：向前端 `Channel` 推送一条数据。
   ChannelData {
     channel: u64,
     #[serde(flatten)]
     payload: Inline,
   },
+  /// Python → Rust：关闭 channel，此后该 channel 的数据被丢弃。
   ChannelClose {
     channel: u64,
   },
 }
 
+/// 与线上表示无关的载荷值。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Payload {
+  /// 无载荷，对前端表现为 `null`。
   None,
+  /// JSON 值。
   Json(Value),
+  /// 原始字节，前端收到 `Uint8Array` / `ArrayBuffer`。
   Raw(Vec<u8>),
 }
 
 impl Payload {
-  /// Message fields and frame body for this payload.
+  /// 拆分为消息头中的载荷字段和帧 body。
   pub fn split(self) -> (Inline, Vec<u8>) {
     match self {
       Self::None => (Inline::default(), Vec::new()),
@@ -134,6 +180,12 @@ impl Payload {
 }
 
 impl Inline {
+  /// 将载荷字段与帧 body 组合为 [`Payload`]，是 [`Payload::split`] 的逆操作。
+  ///
+  /// # Errors
+  ///
+  /// 以下情况返回 [`ProtocolError::Malformed`]（转换为 [`Error`] 后错误码为 `internal`）：
+  /// `raw` 为 `true` 却同时带有 `value`，或未设置 `raw` 而 body 非空。
   pub fn join(self, body: Vec<u8>) -> Result<Payload, ProtocolError> {
     match (self.raw, self.value) {
       (true, None) => Ok(Payload::Raw(body)),
@@ -144,18 +196,26 @@ impl Inline {
   }
 }
 
+/// 一个完整的协议帧：消息头加上可选的二进制 body。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {
+  /// 帧头。
   pub message: Message,
+  /// 帧 body，仅在载荷 `raw: true` 时非空。
   pub body: Vec<u8>,
 }
 
 impl Frame {
+  /// 构造 body 为空的帧。
   pub fn new(message: Message) -> Self {
     Self { message, body: Vec::new() }
   }
 
-  /// `[u32 BE header length][header JSON][body]`, without the outer length prefix.
+  /// 编码为 `[u32 BE 头长度][头 JSON][body]`，不含外层长度前缀（由 [`length_codec`] 添加）。
+  ///
+  /// # Panics
+  ///
+  /// 仅当 [`Message`] 序列化失败时 panic；所有消息都可序列化为 JSON，实际不会发生。
   pub fn encode(&self) -> Bytes {
     let header = serde_json::to_vec(&self.message).expect("messages always serialize");
     let mut buf = BytesMut::with_capacity(4 + header.len() + self.body.len());
@@ -165,6 +225,12 @@ impl Frame {
     buf.freeze()
   }
 
+  /// 从去掉外层长度前缀的帧数据解码。
+  ///
+  /// # Errors
+  ///
+  /// 数据不足 4 字节、头长度超出帧长度或头 JSON 无法解码为 [`Message`] 时返回
+  /// [`ProtocolError::Malformed`]。
   pub fn decode(buf: &[u8]) -> Result<Self, ProtocolError> {
     let (len, rest) = buf
       .split_first_chunk::<4>()
@@ -180,7 +246,7 @@ impl Frame {
   }
 }
 
-/// u32 big-endian length prefix, capped at `max_frame_size`.
+/// 外层分帧编解码器：u32 大端长度前缀，帧长上限为 `max_frame_size`。
 pub fn length_codec(max_frame_size: usize) -> LengthDelimitedCodec {
   LengthDelimitedCodec::builder()
     .big_endian()
@@ -189,19 +255,18 @@ pub fn length_codec(max_frame_size: usize) -> LengthDelimitedCodec {
     .new_codec()
 }
 
-/// Decodes frames on top of [`length_codec`].
+/// 基于 [`length_codec`] 的帧解码器，用于读取 Python 的 stdout。
 ///
-/// Decoding yields `Ok(Err(_))` for a complete but malformed frame (bad JSON, unknown message
-/// type, missing field): the stream is still aligned on a frame boundary and reading can
-/// continue. `Err(_)` is fatal, including [`ProtocolError::TooLarge`] for a length prefix above
-/// the limit: both sides check sizes before sending, so an oversized frame means a broken peer
-/// and is not skipped.
+/// 对于完整但非法的帧（JSON 错误、未知消息类型、字段缺失），解码结果为 `Ok(Err(_))`：
+/// 此时数据流仍对齐在帧边界上，可以继续读取。`Err(_)` 是致命错误，其中包括长度前缀超限时的
+/// [`ProtocolError::TooLarge`]：双方在发送前都会检查大小，出现超限帧说明对端已损坏，因此不跳过。
 pub struct FrameCodec {
   inner: LengthDelimitedCodec,
   max_frame_size: usize,
 }
 
 impl FrameCodec {
+  /// 创建帧长上限为 `max_frame_size` 的解码器。
   pub fn new(max_frame_size: usize) -> Self {
     Self { inner: length_codec(max_frame_size), max_frame_size }
   }
@@ -254,7 +319,7 @@ mod tests {
     Frame { message: Message::Response { id, payload }, body }
   }
 
-  /// Must match `GOLDEN_FRAMES` in python-sdk/tests/test_protocol.py.
+  /// 必须与 `python-sdk/tests/test_protocol.py` 中的 `GOLDEN_FRAMES` 保持一致。
   fn golden_frames() -> Vec<(&'static str, Frame)> {
     let json = |value: Value| Inline { value: Some(value), raw: false };
     vec![

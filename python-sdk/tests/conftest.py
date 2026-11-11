@@ -1,3 +1,5 @@
+"""测试公共设施：构造任意帧的 `raw_frame`，以及通过管道驱动 `App` 的 `Harness` / `harness` fixture。"""
+
 import os
 import threading
 
@@ -8,12 +10,15 @@ from tauri_runtime.protocol import Frame, encode, read_frame
 
 
 def raw_frame(header: bytes, body: bytes = b"") -> bytes:
-    """A frame with an arbitrary (possibly invalid) header."""
+    """以任意（可能非法的）header 字节构造一帧。"""
     return (4 + len(header) + len(body)).to_bytes(4, "big") + len(header).to_bytes(4, "big") + header + body
 
 
 class Harness:
-    """Runs App.serve on a background thread, connected through two OS pipes."""
+    """在后台线程运行 `App.serve`，通过两条 OS 管道模拟 Rust 宿主收发帧。
+
+    构造时会读取 App 发出的第一帧并保存在 `hello` 中。
+    """
 
     def __init__(self, app):
         app_in_r, app_in_w = os.pipe()

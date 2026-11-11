@@ -1,5 +1,12 @@
 # Tauri Plugin py-runtime
 
+[![crates.io](https://img.shields.io/crates/v/tauri-plugin-py-runtime?label=crates.io)](https://crates.io/crates/tauri-plugin-py-runtime)
+[![npm](https://img.shields.io/npm/v/tauri-plugin-py-runtime-api?label=npm)](https://www.npmjs.com/package/tauri-plugin-py-runtime-api)
+[![PyPI](https://img.shields.io/pypi/v/tauri-runtime?label=PyPI)](https://pypi.org/project/tauri-runtime/)
+[![Python](https://img.shields.io/pypi/pyversions/tauri-runtime)](https://pypi.org/project/tauri-runtime/)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](#platform-support)
+
 **Build Tauri desktop apps with a Python backend.**
 
 py-runtime lets you write the backend of a [Tauri 2](https://tauri.app) application in Python
@@ -74,6 +81,48 @@ call goes through Tauri's IPC and permission system.
 | Python | 3.11 or newer (the SDK depends on `pydantic>=2.9`) |
 | [uv](https://docs.astral.sh/uv/) | Recommended. The CLI uses it to manage the backend environment |
 | C compiler | Needed only for packaging: Xcode Command Line Tools on macOS, MSVC or MinGW on Windows, gcc on Linux |
+
+On Linux, Tauri itself needs WebKitGTK and related system libraries; see the
+[Tauri prerequisites](https://tauri.app/start/prerequisites/).
+
+## Platform support
+
+py-runtime targets Tauri's desktop platforms. There are two modes:
+
+- **Development mode** runs your script with a Python interpreter. It is used by `tauri dev` and
+  debug builds.
+- **Packaged mode** runs the standalone executable built by Nuitka. It is used by release builds
+  that set `bundle`.
+
+| Platform | Architectures | Development mode | Packaged mode | Verification |
+| --- | --- | --- | --- | --- |
+| macOS 11+ | Apple silicon (arm64), Intel (x86_64) | ✅ Supported | ✅ Supported | Full release build verified on Apple silicon |
+| Linux | x86_64, arm64 | ✅ Supported | ✅ Supported | Runtime test suite runs in CI on Ubuntu x86_64 |
+| Windows 10/11 | x86_64, arm64 | ✅ Supported | ✅ Supported | Not yet verified |
+| iOS, Android | — | ❌ Not supported | ❌ Not supported | — |
+
+"Supported" means the platform is implemented and expected to work. The Verification column
+shows what has actually been tested; contributions that test the remaining platforms are welcome.
+
+### Platform details
+
+| | macOS / Linux | Windows |
+| --- | --- | --- |
+| Default interpreter | `python3` | `python` |
+| Project virtual environment | `src-python/.venv/bin/python` | `src-python\.venv\Scripts\python.exe` |
+| Packaged executable | `<resources>/py-backend/py-backend` | `<resources>\py-backend\py-backend.exe` |
+| Console window | Not applicable | Hidden: the backend is started without a console window |
+
+### Notes
+
+- **Build on each target platform.** Nuitka compiles to native code for the machine it runs on and
+  can't cross-compile, so build each platform's release on that platform. A CI matrix with one
+  runner per OS and architecture is the simplest way to do this.
+- **Mobile isn't supported.** iOS and Android don't allow an app to start a Python child process,
+  which this plugin's architecture depends on.
+- **Code signing.** Signing and notarizing the packaged backend are not handled yet. On macOS the
+  executable and libraries inside `py-backend/` have to be signed along with the app before
+  notarization. On Windows, unsigned executables may trigger SmartScreen warnings.
 
 ## Quick start
 
@@ -611,16 +660,6 @@ version is 2.
 `python-sdk/tests/fixtures/golden_frames.json` holds one encoded frame per message type, and
 both test suites encode and decode them byte for byte.
 
-## Platform support
-
-| Platform | Development (`tauri dev`) | Packaged backend |
-| --- | --- | --- |
-| macOS (Apple silicon) | Supported | Supported and verified |
-| Windows | Supported | Same layout (`.exe` suffix), not yet verified |
-| Linux | Supported | Same layout, not yet verified |
-
-Code signing and notarization of the packaged backend are not yet handled.
-
 ## Example
 
 `examples/vue` is a complete Vue application that demonstrates commands, raw bytes,
@@ -652,3 +691,7 @@ pnpm install && pnpm build              # build the frontend API (guest-js)
 | 3. Desktop native APIs | Native desktop capabilities exposed to Python | Planned |
 | 4. System extensions | Deeper operating system integration | Planned |
 | 5. Hardware access | Access to devices and peripherals | Planned |
+
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.

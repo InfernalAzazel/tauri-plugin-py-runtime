@@ -10,8 +10,14 @@ links = "tauri-plugin-py-runtime"
 
 [dependencies]
 tauri = { version = "2.11.6" }
-serde = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
+log = "0.4"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 
 [build-dependencies]
 tauri-plugin = { version = "2.6.3", features = ["build"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }

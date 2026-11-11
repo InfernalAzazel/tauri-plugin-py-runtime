@@ -10,6 +10,7 @@ mod desktop;
 #[cfg(mobile)]
 mod mobile;
 
+pub mod bridge;
 mod commands;
 mod error;
 mod models;

@@ -6,7 +6,7 @@ calls, events and streams between the frontend and Python.
 | Part | Package |
 | --- | --- |
 | Rust plugin | `tauri-plugin-py-runtime` (plugin name `py-runtime`) |
-| Python SDK | `tauri-runtime` on PyPI, imported as `tauri_runtime` (Python ≥ 3.10, requires `pydantic>=2.9`) |
+| Python SDK | `tauri-runtime` on PyPI, imported as `tauri_runtime` (Python ≥ 3.11, requires `pydantic>=2.9`) |
 | Frontend API | `tauri-plugin-py-runtime-api` |
 
 The Rust side and Python talk over the child process's stdin/stdout using a small

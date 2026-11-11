@@ -13,15 +13,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-if sys.version_info >= (3, 11):
-    import tomllib
-else:
-    import tomli as tomllib
 
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 KEYS = frozenset({"entry", "name", "output", "nuitka-args"})

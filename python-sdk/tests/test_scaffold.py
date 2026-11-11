@@ -152,30 +152,120 @@ def test_main_py_template_compiles():
     compile(templates.MAIN_PY, "main.py", "exec")
 
 
-def make_tauri_project(root: Path) -> Path:
-    """最小 create-tauri-app 项目：配置、capability、lib.rs 与 package.json。"""
+TEMPLATE_LIB_RS = """\
+// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+#[tauri::command]
+fn greet(name: &str) -> String {
+    format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![greet])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+"""
+
+TEMPLATE_APP_VUE = """\
+<script setup lang="ts">
+import { ref } from "vue";
+import { invoke } from "@tauri-apps/api/core";
+
+const greetMsg = ref("");
+const name = ref("");
+
+async function greet() {
+  // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+  greetMsg.value = await invoke("greet", { name: name.value });
+}
+</script>
+"""
+
+TEMPLATE_ANGULAR = """\
+import { invoke } from "@tauri-apps/api/core";
+
+export class AppComponent {
+  greet(event: SubmitEvent, name: string): void {
+    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+    invoke<string>("greet", { name }).then((text) => {
+      this.greetingMessage.set(text);
+    });
+  }
+}
+"""
+
+TEMPLATE_VANILLA_JS = """\
+const { invoke } = window.__TAURI__.core;
+
+async function greet() {
+  greetMsgEl.textContent = await invoke("greet", { name: greetInputEl.value });
+}
+"""
+
+
+def test_patch_frontend_greet_switches_to_python():
+    text = scaffold.patch_frontend_greet(TEMPLATE_APP_VUE)
+    assert text is not None
+    assert 'import { pyInvoke } from "tauri-plugin-py-runtime-api";' in text
+    assert 'await pyInvoke("greet", { name: name.value });' in text
+    assert "@tauri-apps/api/core" not in text
+    assert "calling-rust" not in text
+    assert scaffold.patch_frontend_greet(text) == text
+
+    angular = scaffold.patch_frontend_greet(TEMPLATE_ANGULAR)
+    assert angular is not None
+    assert 'pyInvoke<string>("greet", { name })' in angular
+
+
+def test_patch_frontend_greet_leaves_unsafe_code_alone():
+    assert scaffold.patch_frontend_greet(TEMPLATE_VANILLA_JS) is None
+    assert scaffold.patch_frontend_greet(TEMPLATE_APP_VUE + 'invoke("other");\n') is None
+    assert scaffold.patch_frontend_greet("const x = 1;\n") == "const x = 1;\n"
+
+
+def test_patch_rust_greet_removes_template_command():
+    text = scaffold.patch_rust_greet(TEMPLATE_LIB_RS)
+    assert text is not None
+    assert "fn greet" not in text
+    assert "invoke_handler" not in text
+    assert "calling-rust" not in text
+    assert text.startswith("#[cfg_attr(mobile, tauri::mobile_entry_point)]\npub fn run() {\n")
+    assert "        .plugin(tauri_plugin_opener::init())\n        .run(" in text
+    assert scaffold.patch_rust_greet(text) is None
+    assert scaffold.patch_rust_greet(LIB_RS) is None
+
+
+def make_tauri_project(root: Path, frontend: dict[str, str] | None = None, lib_rs: str = LIB_RS) -> Path:
+    """最小 create-tauri-app 项目：配置、capability、lib.rs、package.json 与可选的前端文件。"""
     (root / "src-tauri" / "capabilities").mkdir(parents=True)
     (root / "src-tauri" / "src").mkdir()
     (root / "src-tauri" / "tauri.conf.json").write_text(TAURI_CONF)
     (root / "src-tauri" / "capabilities" / "default.json").write_text(json.dumps({"permissions": ["core:default"]}))
-    (root / "src-tauri" / "src" / "lib.rs").write_text(LIB_RS)
+    (root / "src-tauri" / "src" / "lib.rs").write_text(lib_rs)
     (root / "src-tauri" / "build.rs").write_text(BUILD_RS)
     (root / "package.json").write_text("{}")
+    for relative, content in (frontend or {}).items():
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+        (root / relative).write_text(content)
     return root
 
 
 class FakeRun:
-    """记录外部命令（不含程序路径）；`create-tauri-app` 时生成最小项目，可指定失败的程序。"""
+    """记录外部命令（不含程序路径）；`create-tauri-app` 时生成带 Rust greet 示例的模板项目，可指定失败的程序。"""
 
-    def __init__(self, fail: str | None = None):
+    def __init__(self, fail: str | None = None, frontend: dict[str, str] | None = None):
         self.calls: list[tuple[list[str], Path]] = []
         self.fail = fail
+        self.frontend = {"src/App.vue": TEMPLATE_APP_VUE} if frontend is None else frontend
 
     def __call__(self, cmd, cwd, check):
         args = [Path(cmd[0]).name, *cmd[1:]]
         self.calls.append((args, cwd))
         if "tauri-app" in args:
-            make_tauri_project(cwd / args[args.index("tauri-app") + 1])
+            make_tauri_project(cwd / args[args.index("tauri-app") + 1], self.frontend, TEMPLATE_LIB_RS)
         return subprocess.CompletedProcess(cmd, 1 if args[0] == self.fail else 0)
 
 
@@ -201,6 +291,45 @@ def test_init_sets_up_project(tmp_path):
     assert "py-runtime:default" in capability["permissions"]
     conf = json.loads((project / "src-tauri" / "tauri.conf.json").read_text())
     assert scaffold.BUILD_STEP in conf["build"]["beforeBuildCommand"]
+    settings = json.loads((project / ".vscode" / "settings.json").read_text())
+    assert settings == {scaffold.INTERPRETER_SETTING: scaffold.venv_interpreter()}
+    extensions = json.loads((project / ".vscode" / "extensions.json").read_text())
+    assert extensions == {"recommendations": [scaffold.PYTHON_EXTENSION]}
+
+
+def test_venv_interpreter_per_platform():
+    assert scaffold.venv_interpreter(windows=False) == "${workspaceFolder}/src-python/.venv/bin/python"
+    assert scaffold.venv_interpreter(windows=True) == "${workspaceFolder}/src-python/.venv/Scripts/python.exe"
+
+
+def test_patch_vscode_settings_merges_and_respects_user_choice():
+    text = scaffold.patch_vscode_settings('{\n  "svelte.enable-ts-plugin": true\n}\n', "/py")
+    assert text is not None
+    assert json.loads(text) == {"svelte.enable-ts-plugin": True, scaffold.INTERPRETER_SETTING: "/py"}
+    mine = json.dumps({scaffold.INTERPRETER_SETTING: "/usr/bin/python3"})
+    assert scaffold.patch_vscode_settings(mine, "/py") == mine
+    assert scaffold.patch_vscode_settings('{\n  // comment\n  "a": 1\n}\n', "/py") is None
+    assert scaffold.patch_vscode_settings("[]", "/py") is None
+
+
+def test_patch_vscode_extensions_adds_python():
+    template = '{\n  "recommendations": ["Vue.volar", "rust-lang.rust-analyzer"]\n}\n'
+    text = scaffold.patch_vscode_extensions(template)
+    assert text is not None
+    assert json.loads(text)["recommendations"] == ["Vue.volar", "rust-lang.rust-analyzer", scaffold.PYTHON_EXTENSION]
+    assert scaffold.patch_vscode_extensions(text) == text
+    assert scaffold.patch_vscode_extensions('{"recommendations": "x"}') is None
+
+
+def test_setup_vscode_hints_for_unparsable_settings(tmp_path):
+    (tmp_path / ".vscode").mkdir()
+    jsonc = '{\n  // mine\n  "editor.tabSize": 2\n}\n'
+    (tmp_path / ".vscode" / "settings.json").write_text(jsonc)
+    hints = scaffold.setup_vscode(tmp_path)
+    assert len(hints) == 1
+    assert hints[0].startswith(".vscode/settings.json:")
+    assert (tmp_path / ".vscode" / "settings.json").read_text() == jsonc
+    assert (tmp_path / ".vscode" / "extensions.json").is_file()
 
 
 def test_init_refuses_existing_backend_unless_forced(tmp_path):
@@ -246,6 +375,32 @@ def test_create_runs_create_tauri_app_then_init(tmp_path):
     assert run.calls[-1][0] == ["bun", "add", scaffold.GITHUB_SPEC]
     with pytest.raises(scaffold.ScaffoldError, match="already exists"):
         scaffold.create("demo", cwd=tmp_path, run=run)
+
+
+def test_create_replaces_rust_greet_with_python(tmp_path):
+    project, hints = scaffold.create("demo", cwd=tmp_path, run=FakeRun())
+    assert hints == []
+    lib_rs = (project / "src-tauri" / "src" / "lib.rs").read_text()
+    assert "fn greet" not in lib_rs
+    assert "invoke_handler" not in lib_rs
+    assert "tauri_plugin_py_runtime::Builder" in lib_rs
+    assert 'pyInvoke("greet"' in (project / "src" / "App.vue").read_text()
+
+
+def test_create_keeps_rust_greet_when_frontend_cannot_switch(tmp_path):
+    run = FakeRun(frontend={"src/main.js": TEMPLATE_VANILLA_JS})
+    project, hints = scaffold.create("demo", template="vanilla", cwd=tmp_path, run=run)
+    assert len(hints) == 1
+    assert "src/main.js" in hints[0]
+    assert "fn greet" in (project / "src-tauri" / "src" / "lib.rs").read_text()
+    assert (project / "src" / "main.js").read_text() == TEMPLATE_VANILLA_JS
+
+
+def test_init_leaves_existing_greet_alone(tmp_path):
+    project = make_tauri_project(tmp_path, {"src/App.vue": TEMPLATE_APP_VUE}, TEMPLATE_LIB_RS)
+    scaffold.init(project, run=FakeRun())
+    assert "fn greet" in (project / "src-tauri" / "src" / "lib.rs").read_text()
+    assert (project / "src" / "App.vue").read_text() == TEMPLATE_APP_VUE
 
 
 def test_main_init_reports_errors(tmp_path, capsys):

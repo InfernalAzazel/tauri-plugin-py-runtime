@@ -155,6 +155,12 @@ environment. `pnpm tauri build` compiles the backend and bundles it into the app
 | Frontend | Installs the API package with pnpm, yarn, bun or npm. The package manager is detected from the lockfile or `beforeDevCommand` |
 | Permissions | Adds `py-runtime:default` to `capabilities/default.json` |
 | Packaging | Configures `beforeBuildCommand` and `bundle.resources` in `tauri.conf.json`, and `build.rs`, as described in [Distribution](#distribution) |
+| Editor | Points VS Code / Cursor at `src-python/.venv` in `.vscode/settings.json` and recommends the Python extension in `.vscode/extensions.json`. See [Editor setup](#editor-setup) |
+
+`create` also replaces the template's Rust `greet` command with the Python one: the frontend calls
+`pyInvoke("greet", ...)` and the Rust command is removed from `lib.rs`. If the frontend can't be
+switched safely, for example the plain JavaScript template that uses `window.__TAURI__`, the Rust
+example is kept and the CLI prints how to switch it by hand.
 
 Re-running the CLI is safe: files that are already set up are left alone. If `src-python`
 already exists, `init` stops; `--force` continues the setup without overwriting your files. If a
@@ -169,6 +175,59 @@ PyPI. There are two alternatives:
   git.
 - `--path <checkout>` uses a local clone of this repository. Build its frontend package first
   with `pnpm install && pnpm build`.
+
+### Editor setup
+
+The Python backend has its own virtual environment in `src-python/.venv`, which is created by
+`uv sync`. It sits in a subfolder rather than the project root, so your editor might not find it
+on its own. Until you point the editor at it, imports such as `from tauri_runtime import App`
+show as unresolved and you get no completions.
+
+If `src-python/.venv` doesn't exist, create it first:
+
+```bash
+cd src-python && uv sync
+```
+
+| Platform | Interpreter path |
+| --- | --- |
+| macOS / Linux | `src-python/.venv/bin/python` |
+| Windows | `src-python\.venv\Scripts\python.exe` |
+
+**VS Code / Cursor.** `create` and `init` set this up for you. They add the interpreter to
+`.vscode/settings.json` and recommend the Python extension (`ms-python.python`) in
+`.vscode/extensions.json`:
+
+```json
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/src-python/.venv/bin/python"
+}
+```
+
+The path is written for the platform you run the CLI on. On Windows it is
+`${workspaceFolder}/src-python/.venv/Scripts/python.exe`. If you already chose an interpreter,
+the CLI leaves it alone. VS Code allows comments in `settings.json`, but the CLI can't safely
+rewrite a file that has them, so in that case it prints the line to add instead. To set the
+interpreter by hand, run **Python: Select Interpreter** from the Command Palette, choose
+**Enter interpreter path…** and enter the path above.
+
+**PyCharm.** Open **Settings → Project → Python Interpreter → Add Interpreter → Add Local
+Interpreter → Select existing**, then enter the path above. Right-click `src-python` and choose
+**Mark Directory as → Sources Root** so that imports between your backend modules resolve.
+
+**Pyright, basedpyright, Zed, Neovim and other LSP editors.** Add a `pyrightconfig.json` to the
+project root:
+
+```json
+{
+  "venvPath": "src-python",
+  "venv": ".venv",
+  "extraPaths": ["src-python"]
+}
+```
+
+You can also open `src-python` as its own folder or workspace. Most editors detect a `.venv` in
+the folder root automatically.
 
 ## Guide
 

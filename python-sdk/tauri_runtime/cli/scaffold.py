@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import subprocess
 from collections.abc import Callable, Sequence
@@ -44,6 +46,18 @@ LOCKFILES = (
     ("bun.lockb", "bun"),
     ("package-lock.json", "npm"),
 )
+INTERPRETER_SETTING = "python.defaultInterpreterPath"
+PYTHON_EXTENSION = "ms-python.python"
+
+# create-tauri-app 模板自带的 Rust `greet` 示例及其前端调用
+TAURI_INVOKE_IMPORT = 'import { invoke } from "@tauri-apps/api/core";'
+PY_INVOKE_IMPORT = f'import {{ pyInvoke }} from "{NPM_PACKAGE}";'
+INVOKE_CALL = re.compile(r"\binvoke(?=(?:<[^>()]*>)?\()")
+GREET_CALL = re.compile(r'\binvoke(?:<[^>()]*>)?\("greet"')
+TEMPLATE_COMMENT = re.compile(r"[ \t]*// Learn more about Tauri commands at https://tauri\.app/develop/calling-rust/\n")
+RUST_GREET = re.compile(r"#\[tauri::command\]\nfn greet\(name: &str\) -> String \{\n[^\n]*\n\}\n\n?")
+RUST_INVOKE_HANDLER = re.compile(r"[ \t]*\.invoke_handler\(tauri::generate_handler!\[greet\]\)\n")
+FRONTEND_SUFFIXES = frozenset({".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte"})
 
 
 class ScaffoldError(Exception):
@@ -139,6 +153,92 @@ def patch_build_rs(text: str) -> str | None:
             lines.insert(index, build_rs_snippet(line[: len(line) - len(line.lstrip())]))
             return "".join(lines)
     return None
+
+
+def patch_frontend_greet(text: str) -> str | None:
+    """把模板前端对 Rust `greet` 的调用改为调用 Python 的 `greet`。
+
+    不调用 `greet` 时原样返回；无法安全改写（未从 `@tauri-apps/api/core` 导入 `invoke`，
+    或还调用了其他命令）时返回 None。
+    """
+    greet_calls = len(GREET_CALL.findall(text))
+    if greet_calls == 0:
+        return text
+    if TAURI_INVOKE_IMPORT not in text or len(INVOKE_CALL.findall(text)) != greet_calls:
+        return None
+    text = INVOKE_CALL.sub("pyInvoke", text.replace(TAURI_INVOKE_IMPORT, PY_INVOKE_IMPORT))
+    return TEMPLATE_COMMENT.sub("", text)
+
+
+def patch_rust_greet(text: str) -> str | None:
+    """删除模板 `lib.rs` 中的 Rust `greet` 命令及其注册；找不到模板原样代码时返回 None。"""
+    if not (RUST_GREET.search(text) and RUST_INVOKE_HANDLER.search(text)):
+        return None
+    text = RUST_INVOKE_HANDLER.sub("", RUST_GREET.sub("", text, count=1), count=1)
+    return TEMPLATE_COMMENT.sub("", text)
+
+
+def venv_interpreter(windows: bool = os.name == "nt") -> str:
+    """VS Code 中 `src-python` 虚拟环境解释器的路径。"""
+    relative = ".venv/Scripts/python.exe" if windows else ".venv/bin/python"
+    return f"${{workspaceFolder}}/src-python/{relative}"
+
+
+def load_json_object(text: str) -> dict[str, Any] | None:
+    """解析 JSON 对象，空文本视为 `{}`；带注释等无法解析或不是对象时返回 None。"""
+    if not text.strip():
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def patch_vscode_settings(text: str, interpreter: str) -> str | None:
+    """为 `.vscode/settings.json` 设置 Python 解释器；已设置时原样返回，无法解析时返回 None。"""
+    settings = load_json_object(text)
+    if settings is None:
+        return None
+    if INTERPRETER_SETTING in settings:
+        return text
+    settings[INTERPRETER_SETTING] = interpreter
+    return dump_json(settings)
+
+
+def patch_vscode_extensions(text: str) -> str | None:
+    """在 `.vscode/extensions.json` 的推荐中加入 Python 扩展；无法解析时返回 None。"""
+    conf = load_json_object(text)
+    if conf is None:
+        return None
+    recommendations = conf.setdefault("recommendations", [])
+    if not isinstance(recommendations, list):
+        return None
+    if PYTHON_EXTENSION in recommendations:
+        return text
+    recommendations.append(PYTHON_EXTENSION)
+    return dump_json(conf)
+
+
+def setup_vscode(project: Path) -> list[str]:
+    """让 VS Code / Cursor 使用 `src-python/.venv`，返回无法自动处理时的提示。"""
+    vscode = project / ".vscode"
+    interpreter = venv_interpreter()
+    patches: list[tuple[str, Callable[[str], str | None], str]] = [
+        ("settings.json", lambda text: patch_vscode_settings(text, interpreter), f'set "{INTERPRETER_SETTING}" to "{interpreter}"'),
+        ("extensions.json", patch_vscode_extensions, f'add "{PYTHON_EXTENSION}" to recommendations'),
+    ]
+    hints: list[str] = []
+    for name, patch, hint in patches:
+        path = vscode / name
+        text = path.read_text(encoding="utf-8") if path.is_file() else None
+        patched = patch(text or "")
+        if patched is None:
+            hints.append(f".vscode/{name}: {hint}")
+        elif patched != text:
+            vscode.mkdir(exist_ok=True)
+            path.write_text(patched, encoding="utf-8")
+    return hints
 
 
 def detect_package_manager(root: Path) -> str:
@@ -286,7 +386,7 @@ def init(
         hints.append(f"create the Python bundle directory before tauri_build::build() in build.rs:\n{build_rs_snippet('    ')}")
     else:
         patch_file(build_rs, lambda _: patched)
-    return hints
+    return hints + setup_vscode(project)
 
 
 def create(
@@ -307,4 +407,29 @@ def create(
     run_step(run, create_command(name, template, manager), cwd)
     if not project.is_dir():
         raise ScaffoldError(f"create-tauri-app did not create {project}")
-    return project, init(project, source, manager=manager, run=run)
+    hints = init(project, source, manager=manager, run=run)
+    return project, hints + replace_template_greet(project)
+
+
+def replace_template_greet(project: Path) -> list[str]:
+    """把新建项目的 `greet` 示例从 Rust 换成 Python；前端无法全部改写时保留 Rust 版本并返回提示。"""
+    src = project / "src"
+    files = [p for p in src.rglob("*") if p.suffix in FRONTEND_SUFFIXES and p.is_file()] if src.is_dir() else []
+    changes: dict[Path, str] = {}
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        patched = patch_frontend_greet(text)
+        if patched is None:
+            relative = path.relative_to(project).as_posix()
+            return [f'{relative} calls the template\'s Rust "greet" command; call the Python one with pyInvoke("greet", {{ name }})']
+        if patched != text:
+            changes[path] = patched
+    if not changes:
+        return []
+    lib_rs = project / "src-tauri" / "src" / "lib.rs"
+    rust = patch_rust_greet(lib_rs.read_text(encoding="utf-8")) if lib_rs.is_file() else None
+    if rust is not None:
+        changes[lib_rs] = rust
+    for path, text in changes.items():
+        path.write_text(text, encoding="utf-8")
+    return []

@@ -19,6 +19,13 @@ from pathlib import Path
 
 from tauri_runtime.hardening import plugin_path
 
+# Windows 控制台默认 cp1252，打印中文会 UnicodeEncodeError；统一改用 UTF-8（含失败信息）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 # 靶子项目：真实文件，供阅读与单独运行。打包前整份拷到临时目录，保持仓库干净、每次构建隔离。
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "hardening_target"
 

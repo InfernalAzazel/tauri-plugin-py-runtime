@@ -1,0 +1,54 @@
+# 加固插件端到端验证：在三大操作系统 × 两种 CPU 架构（x86_64 / arm64）上以 Nuitka
+# 配合加固插件完整打包一次性后端，校验运行时解密正常，并确认产物中不残留密语字符串
+# 及自有模块名的明文。各平台的 C 工具链（gcc / clang / MSVC）均在此得到完整覆盖。
+name: Hardening verify
+
+on:
+  push:
+    paths:
+      - "python-sdk/tauri_runtime/hardening/**"
+      - "python-sdk/tauri_runtime/cli/bundle.py"
+      - "python-sdk/tests/verify_hardening.py"
+      - ".github/workflows/hardening.yml"
+  pull_request:
+    paths:
+      - "python-sdk/tauri_runtime/hardening/**"
+      - "python-sdk/tauri_runtime/cli/bundle.py"
+      - "python-sdk/tests/verify_hardening.py"
+      - ".github/workflows/hardening.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hardening-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 三大操作系统 × 两种 CPU 架构都要覆盖：
+        # x86_64 → ubuntu-latest / macos-13 / windows-latest；
+        # arm64  → ubuntu-24.04-arm / macos-latest / windows-11-arm。
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-13
+          - macos-latest
+          - windows-latest
+          - windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+
+      # Nuitka 不是 SDK 的依赖，用 --with 临时装上；C 编译器三平台都已自带
+      # （Ubuntu 的 gcc、macOS 的 clang、Windows 的 MSVC）。
+      - name: Verify hardening build
+        working-directory: python-sdk
+        run: uv run --with nuitka python tests/verify_hardening.py

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 import shutil
 import subprocess
@@ -18,8 +19,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..hardening import plugin_path
+
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
-KEYS = frozenset({"entry", "name", "output", "nuitka-args"})
+KEYS = frozenset({"entry", "name", "output", "nuitka-args", "harden"})
+
+# 构建时把项目根传给加固插件，让它知道哪些模块算使用方自己的源码。
+PROJECT_ROOT_ENV = "TAURI_RUNTIME_PROJECT_ROOT"
 
 
 class BuildError(Exception):
@@ -35,12 +41,15 @@ class BuildConfig:
         name: 可执行文件名与产物目录名，只能包含字母、数字、`.`、`_`、`-`。
         output: 输出目录，相对项目目录。
         nuitka_args: 透传给 Nuitka 的额外参数。
+        harden: 是否启用加固插件（第三方库字节码、常量块/模块名加密、strip 符号）。默认开启，
+            关掉就在 `[tool.tauri-runtime.build]` 里写 `harden = false`。
     """
 
     entry: str = "main.py"
     name: str = "py-backend"
     output: str = "dist"
     nuitka_args: tuple[str, ...] = ()
+    harden: bool = True
 
 
 def load_config(project: Path) -> BuildConfig:
@@ -59,6 +68,7 @@ def load_config(project: Path) -> BuildConfig:
         name=str(table.get("name", BuildConfig.name)),
         output=str(table.get("output", BuildConfig.output)),
         nuitka_args=tuple(str(a) for a in table.get("nuitka-args", ())),
+        harden=bool(table.get("harden", BuildConfig.harden)),
     )
     if not NAME_PATTERN.match(config.name):
         raise BuildError(f"invalid name '{config.name}': use letters, digits, '.', '_' or '-'")
@@ -77,6 +87,7 @@ def nuitka_available() -> bool:
 
 def nuitka_command(config: BuildConfig, build_dir: Path, extra: Sequence[str]) -> list[str]:
     """构造 Nuitka standalone 编译命令；使用当前解释器，因此项目依赖均可被收集。"""
+    harden = [f"--user-plugin={plugin_path()}"] if config.harden else []
     return [
         sys.executable,
         "-m",
@@ -86,6 +97,7 @@ def nuitka_command(config: BuildConfig, build_dir: Path, extra: Sequence[str]) -
         "--remove-output",
         f"--output-dir={build_dir}",
         f"--output-filename={config.name}",
+        *harden,
         *config.nuitka_args,
         *extra,
         config.entry,
@@ -114,6 +126,10 @@ def build(
         raise BuildError("Nuitka is not installed in this environment; run `uv add --dev nuitka`")
     if not (project / config.entry).is_file():
         raise BuildError(f"entry script {project / config.entry} not found")
+    if config.harden:
+        # 让加固插件（在 Nuitka 子进程里）知道哪些模块算项目自己的源码；子进程 cwd 已是 project，
+        # 这里再显式设一遍，手动从别处调用时也稳。
+        os.environ[PROJECT_ROOT_ENV] = str(project)
     target = project / config.output / config.name
     with tempfile.TemporaryDirectory(prefix="tauri-runtime-build-") as tmp:
         build_dir = Path(tmp)

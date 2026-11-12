@@ -44,7 +44,8 @@ const message = await pyInvoke<string>("greet", { name: "Tauri" });
 - **Production-grade reliability.** Every call supports timeouts and cancellation. The runtime
   is supervised, can restart after a crash, and shuts down gracefully with bounded deadlines.
 - **Zero-dependency distribution.** `tauri-runtime build` packages the backend with Nuitka
-  into a standalone executable that ships inside your app bundle.
+  into a standalone executable that ships inside your app bundle, and hardens it by default so
+  source strings and module names aren't readable with `strings`.
 - **One-command setup.** `tauri-runtime create` and `tauri-runtime init` scaffold a project or
   add Python to an existing one, including dependencies, configuration and permissions.
 - **Scales with your codebase.** Routers with prefixes organize large backends into modules.
@@ -656,6 +657,7 @@ packaging by hand:
    name = "py-backend"    # executable and folder name
    output = "dist"        # output directory
    nuitka-args = []       # extra Nuitka arguments, e.g. ["--include-data-dir=assets=assets"]
+   harden = true          # enable the hardening plugin, see Hardening
    ```
 
    `uv run tauri-runtime build` produces `dist/py-backend/py-backend` (`py-backend.exe` on
@@ -705,6 +707,40 @@ packaging by hand:
   `nuitka-args` such as `--include-module`, `--include-package-data` or `--include-data-dir`.
 - The first build takes a few minutes. Nuitka caches compiled C files (ccache), so later builds
   are faster.
+
+### Hardening
+
+Nuitka standalone builds are easy to inspect: compiling to C still leaves string constants and
+module names sitting in the binary, where `strings` reads them straight out. To make casual
+inspection harder, `tauri-runtime build` ships a Nuitka plugin that is **enabled by default**. It
+runs on macOS, Linux and Windows, and does four things:
+
+- **Your code is compiled to C; third-party packages are packaged as bytecode.** Compiling
+  libraries to C buys almost no runtime speed (the bottleneck is the network, the webview or the
+  model) but accounts for most of the compile time, so only your own code is compiled.
+- **Constant blocks are encrypted.** String constants — including business prompts and the
+  static parts of f-strings — are encrypted at build time and decrypted at runtime, so they no
+  longer appear in plaintext in the binary.
+- **Module names are encrypted.** Your own module names (such as `app.ai.analysis`) live in
+  Nuitka's module loader table rather than the constant block; they are encrypted too.
+  Third-party names are left alone, since they are public anyway.
+- **Symbols are stripped.** Local function names are removed from the symbol table so the set of
+  functions isn't visible. On macOS the backend is re-signed with an ad-hoc signature afterwards,
+  which Tauri's final signing then supersedes.
+
+**What "your own code" means.** Module-name encryption applies only to modules under the project
+root. The CLI sets the working directory to your project during the build, so this works out of
+the box; when calling Nuitka by hand, set `TAURI_RUNTIME_PROJECT_ROOT` to the project directory.
+
+**This is obfuscation, not real encryption.** The key and the algorithm are inside the binary,
+and at runtime everything is plaintext in memory. The goal is to defeat direct `strings`-style
+searches, not a determined reverse engineer.
+
+**Turning it off and build caching.** Set `harden = false` in `[tool.tauri-runtime.build]` to
+disable it. By default a fresh random key is used on every build, which invalidates Nuitka's
+ccache and forces a full recompile (several minutes). For reproducible builds and ccache hits,
+pin the key with the `TAURI_RUNTIME_HARDENING_KEY` environment variable (for example
+`0xA5C3F17B`); the generated C then stays identical across builds.
 
 ## Reference
 
@@ -839,7 +875,7 @@ pnpm install && pnpm build              # build the frontend API (guest-js)
 | Stage | Scope | Status |
 | --- | --- | --- |
 | 1. Runtime core | Process supervision, protocol, commands, events, channels, Python SDK and frontend API | Available |
-| 2. Build toolchain | Standalone packaging with Nuitka and project scaffolding | Available; signing and cross-platform verification pending |
+| 2. Build toolchain | Standalone packaging with Nuitka, hardening and project scaffolding | Available; signing and cross-platform verification pending |
 | 3. Desktop native APIs | Native desktop capabilities exposed to Python | Planned |
 | 4. System extensions | Deeper operating system integration | Planned |
 | 5. Hardware access | Access to devices and peripherals | Planned |

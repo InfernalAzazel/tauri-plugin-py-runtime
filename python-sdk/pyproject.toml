@@ -45,6 +45,8 @@ dev = ["pytest>=8"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["tauri_runtime"]
+# 加固插件的 C 源码（.c/.h）要随包发布，否则构建时 getExtraCodeFiles 找不到文件。
+artifacts = ["tauri_runtime/hardening/cext/*.c", "tauri_runtime/hardening/cext/*.h"]
 
 [tool.ruff]
 target-version = "py311"

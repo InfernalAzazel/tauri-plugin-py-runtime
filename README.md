@@ -736,9 +736,20 @@ runs on macOS, Linux and Windows, and does four things:
 root. The CLI sets the working directory to your project during the build, so this works out of
 the box; when calling Nuitka by hand, set `TAURI_RUNTIME_PROJECT_ROOT` to the project directory.
 
-**This is obfuscation, not real encryption.** The key and the algorithm are inside the binary,
-and at runtime everything is plaintext in memory. The goal is to defeat direct `strings`-style
-searches, not a determined reverse engineer.
+**This is obfuscation, not real encryption.** The key, the algorithm and the ciphertext all ship
+in the same binary, and at runtime everything is plaintext in memory. The algorithm being open
+source doesn't change this: by Kerckhoffs's principle, security must rest on the key, not on a
+secret algorithm — and here the (32-bit) key is embedded in the build anyway. So hiding the
+algorithm would not meaningfully raise the bar.
+
+What it *does* stop: `strings`, `grep`, unzipping the bundle, and automated secret/prompt
+scanners — the "glance at the files" tier. What it does *not* stop: anyone willing to attach a
+debugger, dump process memory, or read this plugin and extract the key from the binary.
+
+**Don't ship real secrets in the client.** Treat hardening as hygiene against casual inspection,
+not as protection for genuine secrets. Keys, credentials and prompts you truly can't leak should
+live on a server and be fetched at runtime with authentication; any client-side protection is
+ultimately bypassable.
 
 **Turning it off and build caching.** Set `harden = false` in `[tool.tauri-runtime.build]` to
 disable it. By default a fresh random key is used on every build, which invalidates Nuitka's

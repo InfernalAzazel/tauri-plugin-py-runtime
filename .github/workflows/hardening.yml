@@ -45,7 +45,7 @@ jobs:
           - windows-11-arm
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.3
 
       # Nuitka 不是 SDK 的依赖，用 --with 临时装上；C 编译器三平台都已自带
       # （Ubuntu 的 gcc、macOS 的 clang、Windows 的 MSVC）。

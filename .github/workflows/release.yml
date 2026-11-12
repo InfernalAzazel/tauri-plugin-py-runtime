@@ -46,7 +46,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.3
 
       - name: Python SDK tests
         working-directory: python-sdk
@@ -123,7 +123,7 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.3
       - name: Build
         working-directory: python-sdk
         run: uv build

@@ -44,8 +44,12 @@ const message = await pyInvoke<string>("greet", { name: "Tauri" });
 - **Production-grade reliability.** Every call supports timeouts and cancellation. The runtime
   is supervised, can restart after a crash, and shuts down gracefully with bounded deadlines.
 - **Zero-dependency distribution.** `tauri-runtime build` packages the backend with Nuitka
-  into a standalone executable that ships inside your app bundle, and hardens it by default so
-  source strings and module names aren't readable with `strings`.
+  into a standalone executable that ships inside your app bundle, so end users never install
+  Python.
+- **Hardened by default.** Your Python is compiled to native code, string constants (including
+  business prompts) and your module names are encrypted, and symbols are stripped — so a shipped
+  build doesn't give away your source with `strings` or a quick unzip. Works on macOS, Linux and
+  Windows, verified end-to-end across x86_64 and arm64 in CI; turn it off with `harden = false`.
 - **One-command setup.** `tauri-runtime create` and `tauri-runtime init` scaffold a project or
   add Python to an existing one, including dependencies, configuration and permissions.
 - **Scales with your codebase.** Routers with prefixes organize large backends into modules.

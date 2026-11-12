@@ -64,11 +64,15 @@ def test_nuitka_command_mounts_plugin_when_hardened(tmp_path):
 
     cmd = bundle.nuitka_command(bundle.BuildConfig(harden=True), tmp_path, [])
     assert f"--user-plugin={plugin_path()}" in cmd
+    assert "--python-flag=no_docstrings" in cmd
+    assert "--python-flag=no_asserts" in cmd
 
 
 def test_nuitka_command_omits_plugin_when_not_hardened(tmp_path):
     cmd = bundle.nuitka_command(bundle.BuildConfig(harden=False), tmp_path, [])
     assert not any(a.startswith("--user-plugin=") for a in cmd)
+    assert "--python-flag=no_docstrings" not in cmd
+    assert "--python-flag=no_asserts" not in cmd
 
 
 def fake_nuitka(returncode: int = 0):

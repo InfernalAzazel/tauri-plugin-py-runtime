@@ -87,7 +87,17 @@ def nuitka_available() -> bool:
 
 def nuitka_command(config: BuildConfig, build_dir: Path, extra: Sequence[str]) -> list[str]:
     """构造 Nuitka standalone 编译命令；使用当前解释器，因此项目依赖均可被收集。"""
-    harden = [f"--user-plugin={plugin_path()}"] if config.harden else []
+    # 加固时顺带去掉文档字符串与断言：docstring 是会落进产物的字符串常量，asserts 属调试残留，
+    # 发布版都不需要。关掉加固（harden=false）则回归纯净可调试构建。
+    harden = (
+        [
+            f"--user-plugin={plugin_path()}",
+            "--python-flag=no_docstrings",
+            "--python-flag=no_asserts",
+        ]
+        if config.harden
+        else []
+    )
     return [
         sys.executable,
         "-m",

@@ -33,13 +33,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 三大操作系统 × 两种 CPU 架构都要覆盖：
-        # x86_64 → ubuntu-latest / macos-13 / windows-latest；
+        # 三大操作系统 × 两种 CPU 架构尽量覆盖：
+        # x86_64 → ubuntu-latest / windows-latest；
         # arm64  → ubuntu-24.04-arm / macos-latest / windows-11-arm。
+        # macOS 只跑 arm64（macos-latest）：Intel 的 macos-13 托管 runner 资源紧张、常年排队，
+        # 而它和 macos-latest 走的是同一条 clang + strip + codesign 路径，收益不抵阻塞代价。
         os:
           - ubuntu-latest
           - ubuntu-24.04-arm
-          - macos-13
           - macos-latest
           - windows-latest
           - windows-11-arm

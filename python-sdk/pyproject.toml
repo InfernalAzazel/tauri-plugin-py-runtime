@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tauri-runtime"
-version = "0.1.2"
+version = "0.2.0"
 description = "Write the backend of Tauri 2 desktop apps in Python: commands, events, channels and standalone packaging"
 readme = "README.md"
 license = "MIT OR Apache-2.0"

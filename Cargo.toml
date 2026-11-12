@@ -1,6 +1,6 @@
 [package]
 name = "tauri-plugin-py-runtime"
-version = "0.1.2"
+version = "0.2.0"
 authors = ["kylin"]
 description = "Tauri 2 plugin to write your app backend in Python: commands, events, channels and standalone packaging"
 license = "MIT OR Apache-2.0"

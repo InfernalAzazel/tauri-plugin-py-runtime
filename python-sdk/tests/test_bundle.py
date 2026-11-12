@@ -53,6 +53,24 @@ def test_nuitka_command(tmp_path):
     assert cmd[-3:] == ["--lto=no", "--jobs=2", "main.py"]
 
 
+def test_harden_defaults_on_and_reads_false(tmp_path):
+    assert bundle.load_config(write_project(tmp_path)).harden is True
+    project = write_project(tmp_path, "[tool.tauri-runtime.build]\nharden = false\n")
+    assert bundle.load_config(project).harden is False
+
+
+def test_nuitka_command_mounts_plugin_when_hardened(tmp_path):
+    from tauri_runtime.hardening import plugin_path
+
+    cmd = bundle.nuitka_command(bundle.BuildConfig(harden=True), tmp_path, [])
+    assert f"--user-plugin={plugin_path()}" in cmd
+
+
+def test_nuitka_command_omits_plugin_when_not_hardened(tmp_path):
+    cmd = bundle.nuitka_command(bundle.BuildConfig(harden=False), tmp_path, [])
+    assert not any(a.startswith("--user-plugin=") for a in cmd)
+
+
 def fake_nuitka(returncode: int = 0):
     """模拟 Nuitka：成功时在 `--output-dir` 下生成 `<entry 主名>.dist/<name>`。"""
 
